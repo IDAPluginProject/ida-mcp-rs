@@ -335,10 +335,9 @@ publish-cask version revision="":
       binary "ida-mcp"
 
       on_macos do
-        postflight do
-          Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
-          end
+        postflight_steps do
+          run "/usr/bin/xattr",
+              args: ["-dr", "com.apple.quarantine", "{{{{staged_path}}/ida-mcp"]
         end
       end
 
@@ -402,10 +401,9 @@ publish-beta-cask version ida_version="9.4":
 
       binary "ida-mcp"
 
-      postflight do
-        Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
-        end
+      postflight_steps do
+        run "/usr/bin/xattr",
+            args: ["-dr", "com.apple.quarantine", "{{{{staged_path}}/ida-mcp"]
       end
 
       caveats do
@@ -465,10 +463,9 @@ publish-versioned-cask version ida_version:
 
       binary "ida-mcp"
 
-      postflight do
-        Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
-        end
+      postflight_steps do
+        run "/usr/bin/xattr",
+            args: ["-dr", "com.apple.quarantine", "{{{{staged_path}}/ida-mcp"]
       end
 
       caveats do
