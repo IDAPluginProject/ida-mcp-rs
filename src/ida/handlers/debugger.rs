@@ -401,7 +401,7 @@ pub fn runtime_status() -> Value {
                 "backends": [],
                 "backend_selection": "opened_database_target",
                 "transport": "signed_loopback_helper",
-                "message": "Cannot find IDA's signed macOS debugger helpers mac_server_arm or mac_server; set IDADIR to the IDA 9.4 installation directory",
+                "message": "Cannot find IDA's signed macOS debugger helpers mac_server_arm or mac_server; set IDADIR to the IDA 9.5 installation directory",
             })
         }
     }
@@ -675,8 +675,8 @@ fn macos_helper_path(helper_name: &str) -> Result<PathBuf, ToolError> {
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from);
     let default_dirs = [
-        Path::new("/Applications/IDA Professional 9.4.app/Contents/MacOS"),
-        Path::new("/Applications/IDA Pro 9.4.app/Contents/MacOS"),
+        Path::new("/Applications/IDA Professional 9.5.app/Contents/MacOS"),
+        Path::new("/Applications/IDA Pro 9.5.app/Contents/MacOS"),
     ];
 
     find_macos_helper(
@@ -688,7 +688,7 @@ fn macos_helper_path(helper_name: &str) -> Result<PathBuf, ToolError> {
     )
     .ok_or_else(|| {
         ToolError::InvalidParams(format!(
-            "cannot find signed macOS debugger helper {helper_name}; set IDADIR to the IDA 9.4 installation directory"
+            "cannot find signed macOS debugger helper {helper_name}; set IDADIR to the IDA 9.5 installation directory"
         ))
     })
 }

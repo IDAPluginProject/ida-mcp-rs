@@ -535,7 +535,7 @@ fn init_ida_library_with_isolated_idausr(
             info!(
                 sdk_major = sdk_version.0,
                 sdk_minor = sdk_version.1,
-                "Skipping IDA license expiry preflight; IDA 9.4 validates the license during database open"
+                "Skipping IDA license expiry preflight; IDA 9.4+ validates the license during database open"
             );
         }
     }

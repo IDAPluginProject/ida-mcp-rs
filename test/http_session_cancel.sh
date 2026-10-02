@@ -33,7 +33,7 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-if [[ ! -x fixtures/mini ]]; then
+if [[ ! -f fixtures/mini ]]; then
   echo "missing fixture binary: fixtures/mini" >&2
   exit 1
 fi

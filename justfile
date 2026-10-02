@@ -21,16 +21,22 @@ release:
     KACHE_DISABLED=1 cargo build --release
 
 # Build release binary linked against a specific IDA version (local testing, no publish)
-release-against ida_version="9.4":
+release-against ida_version="9.5":
     KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
 
 # Build and publish prerelease (macOS ARM64 only, for local testing)
-prerelease ida_version="9.4": && (update-beta-cask ida_version)
+prerelease ida_version="9.5": && (update-beta-cask ida_version)
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     TARGET=$(git rev-parse HEAD)
+    if grep -Eq '^idalib(-build)? = \{ path' Cargo.toml; then
+        echo "error: Cargo.toml uses local idalib path deps; push the idalib branch and switch idalib/idalib-build back to its git source first" >&2
+        exit 1
+    fi
     KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
+    # Never publish a build whose decompiler cannot attach to the targeted runtime.
+    (cd test && SERVER_BIN=../target/release/ida-mcp just test-decompile)
     mkdir -p dist
     rm -f "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{ justfile_directory() }}" README.md LICENSE
@@ -42,7 +48,7 @@ prerelease ida_version="9.4": && (update-beta-cask ida_version)
         "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
 
 # Update homebrew beta cask in tap
-update-beta-cask ida_version="9.4":
+update-beta-cask ida_version="9.5":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')

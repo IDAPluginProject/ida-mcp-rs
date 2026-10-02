@@ -5,10 +5,10 @@ import json
 import sys
 
 IDA_PATHS = [
-    r"C:\Program Files\IDA Professional 9.4",
-    r"C:\Program Files\IDA Pro 9.4",
-    r"C:\Program Files\IDA Home 9.4",
-    r"C:\Program Files\IDA Essential 9.4",
+    r"C:\Program Files\IDA Professional 9.5",
+    r"C:\Program Files\IDA Pro 9.5",
+    r"C:\Program Files\IDA Home 9.5",
+    r"C:\Program Files\IDA Essential 9.5",
 ]
 
 
@@ -93,7 +93,7 @@ def build_manifest(version: str, x86_64_sha256: str, arm64_sha256: str) -> dict:
             "'IDA_MCP_MANAGED_IDA_PATH', $null, 'User')",
         ],
         "notes": (
-            "Requires IDA Pro 9.4 with a valid license."
+            "Requires IDA Pro 9.5 with a valid license."
             " IDADIR is auto-detected from standard install paths."
         ),
     }

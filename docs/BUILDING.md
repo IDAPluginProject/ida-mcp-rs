@@ -2,12 +2,17 @@
 
 ## Prerequisites
 
-- IDA Pro 9.4 with valid license
+- IDA Pro 9.5 with valid license
 - Rust 1.89+ (stable toolchain; Rust edition 2024 requires at least 1.85, and
   ida-mcp uses standard-library APIs stabilized in 1.89)
 - `just` task runner
 - LLVM/Clang (for C++ bindings)
 - IDA SDK (from Hex-Rays)
+
+`main` builds for the IDA 9.5 beta. The runtime must match the SDK the
+binary was built against (major and minor), so a `main` build will not
+initialize against IDA 9.4. To build for the stable IDA 9.4 line, check out
+the latest `v9.4.x` tag first; packaged releases follow the same rule.
 
 ## Platform-Specific Setup
 
@@ -23,11 +28,11 @@ cd ida-mcp-rs
 just release
 ```
 
-Default IDA path: `/Applications/IDA Professional 9.4.app/Contents/MacOS`
+Default IDA path: `/Applications/IDA Professional 9.5.app/Contents/MacOS`
 
 Override with `IDADIR`:
 ```bash
-env IDADIR='/Applications/IDA Home 9.4.app/Contents/MacOS' just release
+env IDADIR='/Applications/IDA Home 9.5.app/Contents/MacOS' just release
 ```
 
 ### Linux (x86_64)
@@ -41,13 +46,13 @@ sudo apt-get install -y build-essential llvm clang libclang-dev
 # Clone and build
 git clone https://github.com/blacktop/ida-mcp-rs.git
 cd ida-mcp-rs
-env IDADIR=/opt/idapro-9.4 just release
+env IDADIR=/opt/idapro-9.5 just release
 ```
 
 Common Linux IDA paths:
-- `/opt/idapro-9.4`
-- `/home/<user>/idapro-9.4`
-- `/usr/local/idapro-9.4`
+- `/opt/idapro-9.5`
+- `/home/<user>/idapro-9.5`
+- `/usr/local/idapro-9.5`
 
 ### Windows (x86_64 / ARM64)
 
@@ -59,7 +64,7 @@ winget install LLVM.LLVM
 # Option 2: Download from https://releases.llvm.org/
 
 # Set environment variables
-$env:IDADIR = "C:\Program Files\IDA Professional 9.4"
+$env:IDADIR = "C:\Program Files\IDA Professional 9.5"
 $env:PATH = "$env:IDADIR;$env:PATH"
 
 # Ensure LLVM is in PATH
@@ -72,9 +77,9 @@ just release
 ```
 
 Common Windows IDA paths:
-- `C:\Program Files\IDA Professional 9.4`
-- `C:\IDA Professional 9.4`
-- `C:\Program Files\IDA Home 9.4`
+- `C:\Program Files\IDA Professional 9.5`
+- `C:\IDA Professional 9.5`
+- `C:\Program Files\IDA Home 9.5`
 
 ## Build Output
 
@@ -133,4 +138,4 @@ Apple Silicon macOS; Linux and Windows do not advertise them.
 
 ## Cross-Compilation
 
-CI cross-compiles Windows ARM64 from an x86_64 Windows runner using the official IDA 9.4 SDK stubs. Other cross-compilation combinations are not tested; local runtime tests still require the matching IDA architecture.
+CI cross-compiles Windows ARM64 from an x86_64 Windows runner using the official IDA 9.5 SDK stubs. Other cross-compilation combinations are not tested; local runtime tests still require the matching IDA architecture.

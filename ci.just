@@ -41,7 +41,7 @@ package-artifacts:
             '' \
             'ida_dir="${IDADIR:-}"' \
             'if [ -z "$ida_dir" ] && [ -n "${HOME:-}" ]; then' \
-            '    ida_dir="${HOME}/ida-pro-9.4"' \
+            '    ida_dir="${HOME}/ida-pro-9.5"' \
             'fi' \
             'if [ -n "$ida_dir" ]; then' \
             '    export LD_LIBRARY_PATH="${ida_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"' \
@@ -349,7 +349,7 @@ publish-cask version revision="":
     git diff --cached --quiet || git commit -m "Update ida-mcp to ${CASK_VERSION} (IDA ${IDA_VERSION})"
     git push
 
-publish-beta-cask version ida_version="9.4":
+publish-beta-cask version ida_version="9.5":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION="{{ version }}"

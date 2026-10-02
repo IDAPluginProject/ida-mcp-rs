@@ -21,42 +21,42 @@ jobs:
           - os: linux
             arch: x86_64
             runner: ubuntu-24.04
-            idadir: /opt/idapro-9.4
+            idadir: /opt/idapro-9.5
             cargo_args: ""
             artifact_name: ida-mcp-linux-x86_64
             artifact_path: target/release/ida-mcp
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-            idadir: /opt/idapro-9.4
+            idadir: /opt/idapro-9.5
             cargo_args: ""
             artifact_name: ida-mcp-linux-arm64
             artifact_path: target/release/ida-mcp
           - os: macos
             arch: x86_64
             runner: macos-15-intel
-            idadir: /Applications/IDA Professional 9.4.app/Contents/MacOS
+            idadir: /Applications/IDA Professional 9.5.app/Contents/MacOS
             cargo_args: ""
             artifact_name: ida-mcp-macos-x86_64
             artifact_path: target/release/ida-mcp
           - os: macos
             arch: arm64
             runner: macos-15
-            idadir: /Applications/IDA Professional 9.4.app/Contents/MacOS
+            idadir: /Applications/IDA Professional 9.5.app/Contents/MacOS
             cargo_args: ""
             artifact_name: ida-mcp-macos-arm64
             artifact_path: target/release/ida-mcp
           - os: windows
             arch: x86_64
             runner: windows-2025
-            idadir: C:\Program Files\IDA Professional 9.4
+            idadir: C:\Program Files\IDA Professional 9.5
             cargo_args: ""
             artifact_name: ida-mcp-windows-x86_64
             artifact_path: target/release/ida-mcp.exe
           - os: windows
             arch: arm64
             runner: windows-2025
-            idadir: C:\Program Files\IDA Professional 9.4
+            idadir: C:\Program Files\IDA Professional 9.5
             cargo_args: --target aarch64-pc-windows-msvc
             artifact_name: ida-mcp-windows-arm64
             artifact_path: target/aarch64-pc-windows-msvc/release/ida-mcp.exe
