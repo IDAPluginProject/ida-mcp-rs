@@ -6,7 +6,8 @@ Integration tests for ida-mcp using a minimal `mini.c` fixture.
 
 - `curl` (for HTTP tests)
 - `jq` (for most protocol-level integration tests)
-- IDA Pro 9.4 and a valid license for database-backed tests
+- IDA Pro 9.5 (the version `main` targets) and a valid license for
+  database-backed tests
 
 ## Build the fixture
 

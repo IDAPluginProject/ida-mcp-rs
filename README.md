@@ -17,6 +17,7 @@
 ## Prerequisites
 
 - IDA Pro 9.4 with a valid license
+- IDA Pro 9.5 beta for the [beta release](#ida-95-beta)
 
 ## Getting started
 
@@ -51,7 +52,22 @@ nix shell github:blacktop/nur#ida-mcp \
 
 **Build from source:** see [docs/BUILDING.md](docs/BUILDING.md).
 
-> ida-mcp versions follow IDA Pro versions: `v9.4.x` for IDA 9.4, `v9.3.x` for IDA 9.3, and `v9.2.x` for IDA 9.2. ida-mcp checks compatibility when it initializes IDA. An incompatible version causes IDA-backed tools to fail with an error identifying the detected version and, when available, the loaded library path. Scoop and NUR publish only the latest version. For an older IDA, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or, on Apple Silicon, a versioned Homebrew cask.
+> ida-mcp versions follow IDA Pro versions: `v9.5.0-beta.x` for the IDA 9.5 beta, `v9.4.x` for IDA 9.4, `v9.3.x` for IDA 9.3, and `v9.2.x` for IDA 9.2. ida-mcp checks compatibility when it initializes IDA. An incompatible version causes IDA-backed tools to fail with an error identifying the detected version and, when available, the loaded library path. Scoop and NUR publish only the latest version. For an older IDA, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or, on Apple Silicon, a versioned Homebrew cask.
+
+#### IDA 9.5 beta
+
+A prerelease build for the IDA 9.5 beta is available for macOS on Apple Silicon:
+```bash
+brew install blacktop/tap/ida-mcp@beta   # IDA 9.5 beta
+```
+
+The beta cask conflicts with the stable `ida-mcp` cask, so remove one before installing the other:
+```bash
+brew uninstall --cask ida-mcp            # switch to the beta
+brew uninstall --cask ida-mcp@beta       # switch back to stable
+```
+
+You can also download `ida-mcp_<version>_Darwin_arm64.tar.gz` from the [prerelease on GitHub](https://github.com/blacktop/ida-mcp-rs/releases). There are no beta packages for Linux or Windows; build `main` from source as described in [docs/BUILDING.md](docs/BUILDING.md).
 
 ### Platform setup
 
@@ -72,6 +88,8 @@ Paths found automatically:
 - `/Applications/IDA Pro 9.4.app/Contents/MacOS`
 - `/Applications/IDA Home 9.4.app/Contents/MacOS`
 - `/Applications/IDA Essential 9.4.app/Contents/MacOS`
+
+The beta searches the same locations with `9.5` in place of `9.4`.
 
 #### Linux
 
