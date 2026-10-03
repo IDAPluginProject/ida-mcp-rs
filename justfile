@@ -309,3 +309,11 @@ bump:
     fi
     git tag -a "$TAG" -m "Release $TAG"
     git push && git push --tags
+# Benchmark IDA MCP servers with Claude Code headless (paid API calls; run outside the sandbox).
+# Example: just bench --model claude-sonnet-5-5 --effort medium --trials 1
+bench *args: release
+    python3 bench/run.py --binary "$PWD/target/release/ida-mcp" {{ args }}
+
+# Validate the benchmark harness without a model: positive simulations plus negative controls.
+bench-simulate *args: build
+    python3 bench/run.py --binary "$PWD/target/debug/ida-mcp" --simulate --trials 1 {{ args }}

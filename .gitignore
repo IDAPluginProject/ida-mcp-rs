@@ -25,3 +25,6 @@ sdk/
 
 # Release
 dist/
+
+# Python bytecode from the benchmark harness
+__pycache__/
