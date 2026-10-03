@@ -621,6 +621,15 @@ pub struct AddressRequest {
     pub address: Value,
 }
 
+/// One address for a tool that returns one result; a one-element array is
+/// accepted, anything longer is refused.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SingleAddressRequest {
+    #[schemars(description = "One address (string/number); a one-element array is accepted")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LuminaLookupRequest {
     #[schemars(description = "Function address (string/number)")]

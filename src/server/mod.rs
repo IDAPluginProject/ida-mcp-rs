@@ -5525,7 +5525,7 @@ impl IdaMcpServer {
     )]
     async fn stack_frame(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<SingleAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match Self::value_to_exactly_one_address(&req.address, "address") {
             Ok(addr) => addr,
@@ -6959,7 +6959,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "search_structs" => Some(schema::<StructsRequest>()),
         "local_types" => Some(schema::<LocalTypesRequest>()),
         "xrefs_to_field" => Some(schema::<XrefsToFieldRequest>()),
-        "stack_frame" => Some(schema::<AddressRequest>()),
+        "stack_frame" => Some(schema::<SingleAddressRequest>()),
         "declare_type" => Some(schema::<DeclareTypeRequest>()),
         "apply_types" => Some(schema::<ApplyTypesRequest>()),
         "infer_types" => Some(schema::<InferTypesRequest>()),
@@ -7843,6 +7843,11 @@ mod tests {
             assert!(
                 description.contains("one address"),
                 "{name} tools/list description does not say it takes one address: {description}"
+            );
+            let schema_text = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            assert!(
+                !schema_text.contains("Address(es)"),
+                "{name} parameter schema advertises batch input: {schema_text}"
             );
             assert!(
                 crate::tool_registry::get_tool(name)
@@ -9187,7 +9192,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "24dd77639e1bd2ec026d4293a44553ec153afaf9dbb1ee780aff27567e5abb3c"
+            "17f630508e2679c56fc232297269fb2ec473f1126769ae27263333221d440f2a"
         );
     }
 
