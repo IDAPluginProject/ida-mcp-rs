@@ -1003,10 +1003,13 @@ pub struct GetGlobalValueRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct IntConvertRequest {
-    #[schemars(description = "Values to convert (string/number or array)")]
-    #[serde(alias = "input", alias = "inputs")]
-    pub inputs: Value,
+pub struct ReadIntRequest {
+    #[schemars(description = "Address(es) (string/number or array)")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+    #[schemars(description = "Integer width in bytes: 1, 2, 4, or 8.")]
+    #[schemars(range(min = 1, max = 8))]
+    pub size: i64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

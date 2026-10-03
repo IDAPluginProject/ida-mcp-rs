@@ -1,5 +1,6 @@
 //! Response types for IDA worker operations.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +128,7 @@ pub struct DebugInfoLoad {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AnalysisStatus {
     pub auto_enabled: bool,
     pub auto_is_ok: bool,
@@ -170,7 +171,7 @@ pub struct SymbolInfo {
     pub is_weak: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FunctionRangeInfo {
     pub address: String,
     pub name: String,
@@ -188,7 +189,7 @@ pub struct AddressInfo {
 }
 
 /// Function info for listing
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FunctionInfo {
     pub address: String,
     pub name: String,
@@ -196,7 +197,7 @@ pub struct FunctionInfo {
 }
 
 /// Paginated function list result
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FunctionListResult {
     pub functions: Vec<FunctionInfo>,
     pub total: usize,
@@ -217,7 +218,7 @@ pub struct SegmentInfo {
 }
 
 /// String info
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StringInfo {
     pub address: String,
     pub content: String,
@@ -225,7 +226,7 @@ pub struct StringInfo {
 }
 
 /// String list result with pagination
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StringListResult {
     pub strings: Vec<StringInfo>,
     pub total: usize,
@@ -372,7 +373,7 @@ pub struct StructReadResult {
 }
 
 /// Cross-reference info
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct XRefInfo {
     pub from: String,
     pub to: String,
@@ -386,7 +387,7 @@ pub struct XRefInfo {
 /// `next_offset` carries the offset to pass on the next call to page through
 /// the remaining references. High-frequency targets can have enormous xref
 /// counts, so enumeration is always bounded.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct XRefListResult {
     pub xrefs: Vec<XRefInfo>,
     pub truncated: bool,

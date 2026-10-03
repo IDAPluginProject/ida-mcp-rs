@@ -23,6 +23,41 @@ pub(crate) fn json_object(value: Value) -> Result<JsonObject, ToolError> {
     }
 }
 
+/// `_meta` key a child worker sets on a result when its IDA thread caught an
+/// SDK crash while producing it. Result text is user-controlled (script
+/// output, exception messages), so the parent retires on this key only.
+const SDK_CRASHED_META_KEY: &str = "ida-mcp/sdk-crashed";
+
+pub(crate) fn mark_sdk_crashed(result: &mut CallToolResult) {
+    result
+        .meta
+        .get_or_insert_default()
+        .0
+        .insert(SDK_CRASHED_META_KEY.to_string(), Value::Bool(true));
+}
+
+/// The crash a child reported for `tool`, if it marked this result.
+pub(crate) fn sdk_crash(result: &CallToolResult, tool: &str) -> Option<ToolError> {
+    let marked = result
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0.get(SDK_CRASHED_META_KEY))
+        == Some(&Value::Bool(true));
+    if !marked {
+        return None;
+    }
+    let message = if result.is_error == Some(true) {
+        result_error_message(result, tool)
+    } else {
+        format!(
+            "{tool} crashed inside the IDA SDK. The database state can no longer be trusted, \
+             so it is closed without saving and changes since the last save_idb are lost. \
+             Call open_idb again."
+        )
+    };
+    Some(ToolError::SdkCrashed(message))
+}
+
 pub(crate) fn strip_worker_metadata(value: &mut Value) {
     let Value::Object(map) = value else {
         return;
@@ -159,10 +194,40 @@ pub(crate) async fn call_tool(
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
-    use crate::ida::remote::{parse_json, parse_value};
+    use crate::ida::remote::{mark_sdk_crashed, parse_json, parse_value, sdk_crash};
     use crate::ida::types::{MutationTarget, StackVarResult, TargetSelector};
     use rmcp::model::{CallToolResult, ContentBlock as Content};
     use serde_json::{json, Value};
+
+    #[test]
+    fn sdk_crash_is_read_from_the_marker_not_the_text() {
+        let crash_text = "handle_run_script crashed inside the IDA SDK (signal 11).";
+
+        // A script can produce the same words; without the marker that is an
+        // ordinary tool error and the worker keeps its database.
+        let lookalike = ToolError::IdaError(crash_text.to_string()).to_tool_result();
+        assert!(sdk_crash(&lookalike, "run_script").is_none());
+        let err = parse_value(lookalike, "run_script").expect_err("error stays an error");
+        assert!(matches!(err, ToolError::IdaError(_)));
+
+        let mut marked = ToolError::SdkCrashed(crash_text.to_string()).to_tool_result();
+        mark_sdk_crashed(&mut marked);
+        let err = sdk_crash(&marked, "run_script").expect("marked result is a crash");
+        assert!(matches!(err, ToolError::SdkCrashed(message) if message == crash_text));
+    }
+
+    /// Batch tools fold a per-item crash into a successful result; the marker
+    /// must still surface it.
+    #[test]
+    fn sdk_crash_marker_is_honored_on_a_successful_result() {
+        let mut batch = CallToolResult::success(vec![Content::text(
+            r#"{"results":[{"error":"handle_find_bytes crashed"}]}"#,
+        )]);
+        assert!(sdk_crash(&batch, "find_bytes").is_none());
+        mark_sdk_crashed(&mut batch);
+        let err = sdk_crash(&batch, "find_bytes").expect("marked success is a crash");
+        assert!(matches!(err, ToolError::SdkCrashed(message) if message.contains("find_bytes")));
+    }
 
     /// Pooled and workspace parents decode a child's stack result into the
     /// typed struct; the target record must survive that round trip,

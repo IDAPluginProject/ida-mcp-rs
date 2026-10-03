@@ -2,6 +2,7 @@
 
 pub mod http_access;
 pub mod http_config;
+mod instructions;
 mod operation;
 mod requests;
 pub mod task;
@@ -36,6 +37,7 @@ use rmcp::{
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::pin::Pin;
@@ -1098,36 +1100,7 @@ impl IdaMcpServer {
     }
 
     fn instructions(&self) -> String {
-        format!(
-            "IDA Pro headless analysis server for reverse engineering binaries. \
-                 \n\nWorkflow: \
-                 \n1. open_idb: Open a .i64/.idb file or a raw binary (Mach-O/ELF/PE). Large DBs may take 30+ seconds. \
-                 \n   load_debug_info: Optional for existing .i64 to load DWARF/dSYM \
-                 \n2. tool_catalog: Discover tools for your task (e.g., 'find callers', 'decompile') \
-                 \n3. tool_help: Get full docs for a specific tool \
-                 \n4. Use the discovered tools to analyze the binary \
-                 \n5. close_idb: Optionally close when done \
-                 \n\nNote: tools/list exposes the full tool set by default; use tool_catalog/tool_help to discover usage. \
-                 \n{close_hint} \
-                 \n\nTool Categories: \
-                 \n- core: open/close/discover (open_idb, close_idb, tool_catalog, tool_help, recent_operations, idb_meta) \
-                 \n- functions: list, resolve, lookup functions \
-                 \n- disassembly: disasm at addresses \
-                 \n- decompile: Hex-Rays pseudocode \
-                 \n- xrefs: cross-reference analysis \
-                 \n- control_flow: CFG, callgraph, paths \
-                 \n- memory: read bytes, strings, values \
-                 \n- search: find patterns, strings \
-                 \n- metadata: segments, imports, exports, Lumina lookup \
-                 \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
-                \n- editing: comments/rename/patch/patch_asm/Lumina apply \
-                 \n- scripting: run_script (execute IDAPython code) \
-                 \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
-                 \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis. \
-                 \nTip: After a timeout or cancellation, call recent_operations to inspect the last recorded foreground phase. \
-                 \nTip: After dsc_add_dylib or dsc_add_region, call analysis_status; if auto_is_ok=false, run analyze_funcs before xrefs/decompile.",
-            close_hint = self.close_hint()
-        )
+        instructions::build(&self.filter, self.close_hint())
     }
 
     fn validate_path(path: &str) -> bool {
@@ -1159,17 +1132,39 @@ impl IdaMcpServer {
     }
 
     fn parse_address(s: &str) -> Result<u64, ToolError> {
-        let mut s = s.trim().to_string();
-        s.retain(|c| c != '_');
-        if s.starts_with("0x") || s.starts_with("0X") {
-            u64::from_str_radix(&s[2..], 16).map_err(|_| ToolError::InvalidAddress(s))
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            u64::from_str_radix(&s[2..], 2).map_err(|_| ToolError::InvalidAddress(s))
-        } else if s.starts_with("0o") || s.starts_with("0O") {
-            u64::from_str_radix(&s[2..], 8).map_err(|_| ToolError::InvalidAddress(s))
+        let original = s.trim();
+        // Underscores are digit separators (0x1000_0000); they are removed
+        // for parsing but the error echoes what the caller sent.
+        let digits: String = original.chars().filter(|c| *c != '_').collect();
+        let parsed = if let Some(hex) = digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+        } else if let Some(bin) = digits.strip_prefix("0b").or(digits.strip_prefix("0B")) {
+            u64::from_str_radix(bin, 2)
+        } else if let Some(oct) = digits.strip_prefix("0o").or(digits.strip_prefix("0O")) {
+            u64::from_str_radix(oct, 8)
         } else {
-            s.parse()
-                .map_err(|_| ToolError::InvalidAddress(s.to_string()))
+            digits.parse()
+        };
+        parsed.map_err(|_| ToolError::InvalidAddress(Self::describe_bad_address(original)))
+    }
+
+    /// A symbol passed where an address was expected is the common mistake;
+    /// say so instead of echoing a string the model cannot act on.
+    fn describe_bad_address(original: &str) -> String {
+        let looks_like_symbol = original
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && !original.starts_with("0x")
+            && !original.starts_with("0X");
+        if looks_like_symbol {
+            format!(
+                "{original:?} is a symbol name, not an address; pass a hex address such as \
+                 0x100000660, or give the name to a tool's target_name/name parameter, or \
+                 resolve it first with resolve_function"
+            )
+        } else {
+            format!("{original:?} is not a hex (0x...), decimal, octal (0o...), or binary (0b...) address")
         }
     }
 
@@ -1315,14 +1310,6 @@ impl IdaMcpServer {
 
     /// Wrap a per-address xref result for the multi-address response, injecting
     /// the queried address into the serialized listing.
-    fn xrefs_entry(addr: u64, result: crate::ida::types::XRefListResult) -> Value {
-        let mut entry = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
-        if let Value::Object(map) = &mut entry {
-            map.insert("address".to_string(), json!(format!("{:#x}", addr)));
-        }
-        entry
-    }
-
     /// Fetch one paginated xref listing in the given direction.
     async fn xrefs_for(
         &self,
@@ -1367,30 +1354,26 @@ impl IdaMcpServer {
                 .xrefs_for(addrs[0], offset, limit, timeout_secs, direction)
                 .await
             {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
+                Ok(result) => Ok(typed_result(&XrefsOutput::Single(result))),
                 Err(e) => Ok(e.to_tool_result()),
             }
         } else {
             let mut results = Vec::new();
             for addr in addrs {
+                let address = format!("{addr:#x}");
                 match self
                     .xrefs_for(addr, offset, limit, timeout_secs, direction)
                     .await
                 {
-                    Ok(result) => results.push(Self::xrefs_entry(addr, result)),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
+                    Ok(listing) => results.push(XrefsBatchEntry::Listing { address, listing }),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
+                    Err(e) => results.push(XrefsBatchEntry::Error {
+                        address,
+                        error: e.to_string(),
+                    }),
                 }
             }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
+            Ok(typed_result(&XrefsOutput::Batch { results }))
         }
     }
 
@@ -1547,12 +1530,30 @@ impl IdaMcpServer {
         // response when fast tools coalesce into a single Node stdin `data`
         // event, dropping the Claude Code transport with "unknown progress
         // token". Phases remain observable via `recent_operations`.
+        // The drain cannot wait for every sender to drop: an IDA SDK crash
+        // unwinds with siglongjmp, which skips the destructor of a handler's
+        // heartbeat and leaves its sender alive. The finished operation ends
+        // the drain instead.
+        let operation_finished = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn({
             let registry = self.operation_registry.clone();
             let op_id = op_id.clone();
+            let operation_finished = operation_finished.clone();
             async move {
-                while let Some(update) = progress_rx.recv().await {
-                    registry.record_progress(&op_id, update.phase, update.message);
+                loop {
+                    tokio::select! {
+                        biased;
+                        update = progress_rx.recv() => {
+                            let Some(update) = update else { break };
+                            registry.record_progress(&op_id, update.phase, update.message);
+                        }
+                        () = operation_finished.cancelled() => {
+                            while let Ok(update) = progress_rx.try_recv() {
+                                registry.record_progress(&op_id, update.phase, update.message);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -1580,6 +1581,7 @@ impl IdaMcpServer {
 
         match outcome {
             Outcome::Finished(result) => {
+                operation_finished.cancel();
                 let _ = drain_task.await;
                 match result {
                     Ok(value) => {
@@ -1858,6 +1860,7 @@ impl IdaMcpServer {
 
         let analysis_status = match self.worker.analysis_status_for_generation(generation).await {
             Ok(status) => Some(status),
+            Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
             Err(err) => {
                 warn!(module = %module, error = %err, "failed to fetch analysis_status after open_dsc");
                 None
@@ -2292,6 +2295,18 @@ impl IdaMcpServer {
             }
             analysis_status = match analysis_status_result {
                 Ok(status) => Some(status),
+                Err(err) if err.is_fatal() => {
+                    // The worker already discarded the database; there is
+                    // nothing left to close.
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        &err,
+                        &cancel_token,
+                        "Cancelled after the worker was lost",
+                    );
+                    return;
+                }
                 Err(err) => {
                     warn!(module = %module, error = %err, "failed to fetch analysis_status after background open_dsc");
                     None
@@ -3011,6 +3026,9 @@ impl IdaMcpServer {
                     if info.analysis_status.auto_is_ok {
                         quick_tools.extend(["decompile", "xrefs_to"]);
                     }
+                    // Only recommend what this (public) server advertises; a
+                    // child worker's own filter is always unrestricted.
+                    quick_tools.retain(|name| self.filter.is_enabled(name));
                     map.insert("quick_tools".to_string(), json!(quick_tools));
                     if let Some(slice) = &universal {
                         map.insert("universal".to_string(), json!(slice));
@@ -3778,17 +3796,25 @@ impl IdaMcpServer {
         debug!("Tool call: analysis_status");
         match self.worker.analysis_status().await {
             Ok(status) => {
-                let mut value =
-                    serde_json::to_value(&status).unwrap_or_else(|_| json!(format!("{status:?}")));
-                if !matches!(self.mode, ServerMode::Worker)
-                    && let Value::Object(map) = &mut value
-                {
-                    map.insert("session_id".to_string(), json!(self.session_id));
-                }
-                Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{status:?}")),
-                )]))
+                let session_id = match self.mode {
+                    ServerMode::Worker => None,
+                    ServerMode::Stdio | ServerMode::Http => Some(self.session_id.clone()),
+                };
+                Ok(typed_result(&AnalysisStatusOutput { status, session_id }))
             }
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(description = "Save the open database to disk without closing it. \
+        Use this to checkpoint renames, comments, types, and patches.")]
+    #[instrument(skip_all)]
+    async fn save_idb(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: save_idb");
+        match self.worker.save_database().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4064,39 +4090,7 @@ impl IdaMcpServer {
             .list_functions(offset, limit, filter, timeout_secs)
             .await
         {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
-            Err(e) => Ok(e.to_tool_result()),
-        }
-    }
-
-    #[tool(description = "List functions (ida-pro-mcp compatible alias).")]
-    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
-    async fn list_funcs(
-        &self,
-        Parameters(req): Parameters<ListFunctionsRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        debug!("Tool call: list_funcs");
-        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit"))
-            .unwrap_or(100)
-            .min(10000);
-        let offset =
-            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
-        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
-            req.timeout_secs,
-            "timeout_secs"
-        ));
-        let filter = req.filter.clone();
-
-        match self
-            .worker
-            .list_functions(offset, limit, filter, timeout_secs)
-            .await
-        {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
+            Ok(result) => Ok(typed_result(&result)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4109,9 +4103,7 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: resolve_function");
         match self.worker.resolve_function(&req.name).await {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
+            Ok(info) => Ok(typed_result(&info)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4159,9 +4151,7 @@ impl IdaMcpServer {
             .function_at(addr, req.target_name.clone(), offset)
             .await
         {
-            Ok(info) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&info).unwrap_or_else(|_| format!("{:?}", info)),
-            )])),
+            Ok(info) => Ok(typed_result(&info)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4195,6 +4185,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "disasm": text
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4303,6 +4294,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "decompile": code
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4358,6 +4350,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "pseudocode": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4405,9 +4398,7 @@ impl IdaMcpServer {
             .strings(offset, limit, req.filter, timeout_secs)
             .await
         {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
-            )])),
+            Ok(result) => Ok(typed_result(&result)),
             Err(e) => Ok(e.to_tool_result()),
         }
     }
@@ -4601,6 +4592,7 @@ impl IdaMcpServer {
                             "address": format!("{:#x}", addr),
                             "bytes": result
                         })),
+                        Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                         Err(e) => results.push(json!({
                             "address": format!("{:#x}", addr),
                             "error": e.to_string()
@@ -4693,6 +4685,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "basic_blocks": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4734,6 +4727,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "callees": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4775,6 +4769,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "callers": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4947,6 +4942,7 @@ impl IdaMcpServer {
                         "next_offset": next_offset
                     }));
                 }
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "pattern": pattern,
                     "error": e.to_string()
@@ -5043,6 +5039,7 @@ impl IdaMcpServer {
                         "next_offset": next_offset
                     }));
                 }
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "target": target,
                     "error": e.to_string()
@@ -5056,40 +5053,25 @@ impl IdaMcpServer {
         )]))
     }
 
-    #[tool(description = "Read u8 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u8(
+    #[tool(description = "Read unsigned integer(s) of a given byte width at address(es)")]
+    #[instrument(skip_all, fields(size = req.size))]
+    async fn read_int(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<ReadIntRequest>,
     ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 1).await
-    }
-
-    #[tool(description = "Read u16 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u16(
-        &self,
-        Parameters(req): Parameters<AddressRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 2).await
-    }
-
-    #[tool(description = "Read u32 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u32(
-        &self,
-        Parameters(req): Parameters<AddressRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 4).await
-    }
-
-    #[tool(description = "Read u64 values at address(es)")]
-    #[instrument(skip_all)]
-    async fn get_u64(
-        &self,
-        Parameters(req): Parameters<AddressRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        get_int_values(&self.worker, req.address, 8).await
+        let size = match req.size {
+            1 => 1,
+            2 => 2,
+            4 => 4,
+            8 => 8,
+            other => {
+                return Ok(ToolError::InvalidParams(format!(
+                    "unsupported integer size {other}; use 1, 2, 4, or 8 bytes"
+                ))
+                .to_tool_result());
+            }
+        };
+        get_int_values(&self.worker, req.address, size).await
     }
 
     #[tool(description = "Read string(s) at address(es)")]
@@ -5123,6 +5105,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "string": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -5164,6 +5147,7 @@ impl IdaMcpServer {
                         "query": query,
                         "value": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "query": query,
                         "error": e.to_string()
@@ -5257,6 +5241,7 @@ impl IdaMcpServer {
                         "root": format!("{:#x}", root),
                         "callgraph": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "root": format!("{:#x}", root),
                         "error": e.to_string()
@@ -5334,50 +5319,6 @@ impl IdaMcpServer {
                 Err(e) => Ok(e.to_tool_result()),
             }
         }
-    }
-
-    #[tool(description = "Convert integers between bases")]
-    #[instrument(skip_all)]
-    async fn int_convert(
-        &self,
-        Parameters(req): Parameters<IntConvertRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        debug!("Tool call: int_convert");
-        let inputs = match Self::value_to_strings(&req.inputs) {
-            Ok(v) => v,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-
-        let mut results = Vec::new();
-        for input in inputs {
-            match Self::parse_address(&input) {
-                Ok(value) => {
-                    let le = value.to_le_bytes();
-                    let be = value.to_be_bytes();
-                    let le_trim = trim_bytes_le(&le);
-                    let be_trim = trim_bytes_be(&be);
-                    results.push(json!({
-                        "input": input,
-                        "value": value,
-                        "dec": value.to_string(),
-                        "hex": format!("0x{:x}", value),
-                        "bin": format!("0b{:b}", value),
-                        "bytes_le": hex_encode(&le_trim),
-                        "bytes_be": hex_encode(&be_trim),
-                        "ascii": bytes_to_ascii(&le_trim),
-                    }));
-                }
-                Err(e) => results.push(json!({
-                    "input": input,
-                    "error": e.to_string()
-                })),
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({ "results": results }))
-                .unwrap_or_else(|_| format!("{:?}", results)),
-        )]))
     }
 
     #[tool(description = "List local types")]
@@ -5729,6 +5670,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "struct": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -6334,6 +6276,7 @@ impl IdaMcpServer {
             Ok(image) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
+                    Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
                     Err(err) => {
                         warn!(module = %module, error = %err, "failed to fetch analysis_status after dsc_add_dylib");
                         None
@@ -6410,6 +6353,7 @@ impl IdaMcpServer {
             Ok(region) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
+                    Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
                     Err(err) => {
                         warn!(
                             address = %ea_hex,
@@ -6571,8 +6515,11 @@ impl IdaMcpServer {
 
     #[tool(
         description = "Execute IDAPython in the open database. Provide 'code' (inline) \
-        or 'file' (path to .py), not both. Returns captured stdout/stderr. \
-        Full access to ida_*, idc, idautils."
+        or 'file' (path to .py), not both. Returns captured stdout/stderr, \
+        plus a trailing expression as `result` (JSON up to 1 MiB; \
+        result_is_repr=true when it had to fall back to repr()). Imports, \
+        variables, and functions persist between calls on the same open \
+        database. Full access to ida_*, idc, idautils."
     )]
     #[instrument(skip_all, fields(code_len = req.code.as_ref().map_or(0, String::len)))]
     async fn run_script(
@@ -6826,6 +6773,7 @@ async fn get_int_values(
                     "address": format!("{:#x}", addr),
                     "value": result
                 })),
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "address": format!("{:#x}", addr),
                     "error": e.to_string()
@@ -6839,38 +6787,78 @@ async fn get_int_values(
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn trim_bytes_le(bytes: &[u8]) -> Vec<u8> {
-    let mut out = bytes.to_vec();
-    while out.len() > 1 && out.last() == Some(&0) {
-        out.pop();
+/// Serialize a typed result as pretty text plus `structuredContent`, so
+/// clients that read the advertised output schema get the same value the
+/// text carries.
+fn typed_result<T: Serialize + std::fmt::Debug>(value: &T) -> CallToolResult {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| format!("{value:?}"));
+    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    if let Ok(structured @ Value::Object(_)) = serde_json::to_value(value) {
+        result.structured_content = Some(structured);
     }
-    out
+    result
 }
 
-fn trim_bytes_be(bytes: &[u8]) -> Vec<u8> {
-    let mut start = 0usize;
-    while start + 1 < bytes.len() && bytes[start] == 0 {
-        start += 1;
+/// `analysis_status` as a client sees it: the worker's status plus the
+/// session that answered (absent inside a child worker).
+#[derive(Debug, Serialize, JsonSchema)]
+struct AnalysisStatusOutput {
+    #[serde(flatten)]
+    status: crate::ida::types::AnalysisStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+}
+
+/// One `xrefs_to`/`xrefs_from` entry when several addresses are queried at
+/// once: the address's listing, or the error that address produced.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+enum XrefsBatchEntry {
+    Listing {
+        address: String,
+        #[serde(flatten)]
+        listing: crate::ida::types::XRefListResult,
+    },
+    Error {
+        address: String,
+        error: String,
+    },
+}
+
+/// `xrefs_to`/`xrefs_from` return the listing itself for one address and a
+/// `results` array for several.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum XrefsOutput {
+    Single(crate::ida::types::XRefListResult),
+    Batch { results: Vec<XrefsBatchEntry> },
+}
+
+/// Output schema for tools whose result is a typed object. Tools whose
+/// result is a bare array or a shape built per call advertise none.
+///
+/// MCP requires the literal root `"type": "object"`, and clients validate it
+/// before accepting the tool inventory; a union of object variants gets it
+/// added explicitly because schemars leaves the root of an `anyOf` untyped.
+fn tool_output_schema(name: &str) -> Option<Value> {
+    fn schema<T: JsonSchema>() -> Value {
+        let mut value = serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}));
+        normalize_schema_value(&mut value);
+        if let Value::Object(root) = &mut value {
+            root.entry("type").or_insert_with(|| json!("object"));
+        }
+        value
     }
-    bytes[start..].to_vec()
-}
 
-fn bytes_to_ascii(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| {
-            let c = *b as char;
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '.'
-            }
-        })
-        .collect()
+    match name {
+        "analysis_status" => Some(schema::<AnalysisStatusOutput>()),
+        "list_functions" => Some(schema::<crate::ida::types::FunctionListResult>()),
+        "resolve_function" => Some(schema::<crate::ida::types::FunctionInfo>()),
+        "function_at" => Some(schema::<crate::ida::types::FunctionRangeInfo>()),
+        "strings" => Some(schema::<crate::ida::types::StringListResult>()),
+        "xrefs_to" | "xrefs_from" => Some(schema::<XrefsOutput>()),
+        _ => None,
+    }
 }
 
 fn tool_params_schema(name: &str) -> Option<Value> {
@@ -6893,7 +6881,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "debug_attach" => Some(schema::<DebugAttachRequest>()),
         "debug_stop" => Some(schema::<DebugStopRequest>()),
         "debug_open_module" => Some(schema::<DebugOpenModuleRequest>()),
-        "analysis_status" => Some(schema::<EmptyParams>()),
+        "analysis_status" | "save_idb" => Some(schema::<EmptyParams>()),
         "list_databases" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
@@ -6902,7 +6890,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "idb_meta" => Some(schema::<EmptyParams>()),
 
         // Functions
-        "list_functions" | "list_funcs" => Some(schema::<ListFunctionsRequest>()),
+        "list_functions" => Some(schema::<ListFunctionsRequest>()),
         "resolve_function" => Some(schema::<ResolveFunctionRequest>()),
         "addr_info" => Some(schema::<AddrInfoRequest>()),
         "function_at" => Some(schema::<FunctionAtRequest>()),
@@ -6928,7 +6916,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "get_bytes" => Some(schema::<GetBytesRequest>()),
         "list_patches" => Some(schema::<ListPatchesRequest>()),
         "get_string" => Some(schema::<GetStringRequest>()),
-        "get_u8" | "get_u16" | "get_u32" | "get_u64" => Some(schema::<AddressRequest>()),
+        "read_int" => Some(schema::<ReadIntRequest>()),
         "get_global_value" => Some(schema::<GetGlobalValueRequest>()),
         "strings" => Some(schema::<StringsRequest>()),
         "find_string" => Some(schema::<FindStringRequest>()),
@@ -6945,7 +6933,6 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "lumina_lookup" => Some(schema::<LuminaLookupRequest>()),
         "lumina_apply" => Some(schema::<LuminaApplyRequest>()),
         "list_globals" => Some(schema::<ListGlobalsRequest>()),
-        "int_convert" => Some(schema::<IntConvertRequest>()),
 
         // Editing
         "set_comments" => Some(schema::<SetCommentsRequest>()),
@@ -7205,6 +7192,9 @@ pub struct SanitizedIdaServer<S> {
     inner: S,
     filter: Arc<tool_filter::ToolFilter>,
     workspace: bool,
+    /// Set in child workers: a crash caught while a call ran is reported to
+    /// the parent on that call's result.
+    sdk_crash: Option<crate::crash_guard::SdkCrashSignal>,
 }
 
 impl<S> SanitizedIdaServer<S> {
@@ -7215,6 +7205,7 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter: Arc::new(tool_filter::ToolFilter::unrestricted()),
             workspace: false,
+            sdk_crash: None,
         }
     }
 
@@ -7224,6 +7215,7 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter,
             workspace: false,
+            sdk_crash: None,
         }
     }
 
@@ -7232,7 +7224,15 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter,
             workspace: true,
+            sdk_crash: None,
         }
+    }
+
+    /// Report IDA SDK crashes to a pool parent on the result of the call
+    /// that was running. Used by child workers only.
+    pub fn reporting_sdk_crashes(mut self, signal: crate::crash_guard::SdkCrashSignal) -> Self {
+        self.sdk_crash = Some(signal);
+        self
     }
 }
 
@@ -7279,6 +7279,10 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
 
 fn set_tool_metadata(tool: &mut Tool) {
     tool.annotations = Some(tool_annotations_for(&tool.name));
+    tool.output_schema = tool_output_schema(&tool.name).and_then(|schema| match schema {
+        Value::Object(object) => Some(Arc::new(object)),
+        _ => None,
+    });
 }
 
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
@@ -7568,7 +7572,23 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
                 None,
             ));
         }
-        self.inner.call_tool(params, ctx).await
+        let tool = params.name.to_string();
+        let response = self.inner.call_tool(params, ctx).await;
+        if !self.sdk_crash.as_ref().is_some_and(|signal| signal.take()) {
+            return response;
+        }
+        let mut result = match response {
+            Ok(CallToolResponse::Complete(result)) => result,
+            // A crash leaves no trustworthy partial state to resume or poll,
+            // so every other shape collapses to a terminal error.
+            Ok(_) | Err(_) => ToolError::SdkCrashed(format!(
+                "{tool} crashed inside the IDA SDK. The database state can no longer be \
+                 trusted; reopen it."
+            ))
+            .to_tool_result(),
+        };
+        crate::ida::remote::mark_sdk_crashed(&mut result);
+        Ok(CallToolResponse::Complete(result))
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -7636,6 +7656,9 @@ mod tests {
         workspace_close_should_remove_entry, workspace_tool_example, DscOpenPlan, IdaMcpServer,
         OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest,
         ToolHelpRequest, XrefsRequest,
+    };
+    use crate::server::{
+        tool_output_schema, typed_result, AnalysisStatusOutput, XrefsBatchEntry, XrefsOutput,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -7714,6 +7737,288 @@ mod tests {
             Arc::new(crate::IdaWorker::new(tx)),
             crate::ServerMode::Stdio,
         )
+    }
+
+    /// Addresses parse with digit separators; a symbol in an address slot is
+    /// named as such, with the original spelling, and pointed at the fix.
+    #[test]
+    fn bad_addresses_are_explained_in_the_callers_terms() {
+        assert_eq!(
+            IdaMcpServer::parse_address("0x1000_0660").unwrap(),
+            0x1000_0660
+        );
+        assert_eq!(IdaMcpServer::parse_address(" 4096 ").unwrap(), 4096);
+        assert_eq!(IdaMcpServer::parse_address("0b101").unwrap(), 5);
+        assert_eq!(IdaMcpServer::parse_address("0o17").unwrap(), 15);
+
+        let symbol = IdaMcpServer::parse_address("helper_mix")
+            .unwrap_err()
+            .to_string();
+        assert!(symbol.contains("\"helper_mix\""), "{symbol}");
+        assert!(symbol.contains("symbol name"), "{symbol}");
+        assert!(symbol.contains("resolve_function"), "{symbol}");
+        assert!(!symbol.contains("helpermix"), "{symbol}");
+
+        let junk = IdaMcpServer::parse_address("0xZZ").unwrap_err().to_string();
+        assert!(
+            junk.contains("\"0xZZ\"") && junk.contains("not a hex"),
+            "{junk}"
+        );
+    }
+
+    /// Every advertised output schema carries MCP's required root object
+    /// type, and the handler's structured content equals its text and
+    /// validates against that schema, so the three views cannot drift apart.
+    #[test]
+    fn output_schemas_match_the_structured_results() {
+        use crate::ida::types::{
+            AnalysisStatus, FunctionInfo, FunctionListResult, FunctionRangeInfo, StringInfo,
+            StringListResult, XRefInfo, XRefListResult,
+        };
+
+        let advertised: Vec<&str> = crate::tool_registry::all_tools()
+            .map(|tool| tool.name)
+            .filter(|name| tool_output_schema(name).is_some())
+            .collect();
+        assert_eq!(
+            advertised,
+            [
+                "analysis_status",
+                "list_functions",
+                "resolve_function",
+                "function_at",
+                "xrefs_to",
+                "xrefs_from",
+                "strings",
+            ]
+        );
+        for name in &advertised {
+            let schema = tool_output_schema(name).expect("schema");
+            // MCP's Tool.outputSchema requires this literal root property;
+            // the TypeScript SDK rejects the whole inventory without it.
+            assert_eq!(
+                schema["type"], "object",
+                "{name} output schema lacks a root type: {schema}"
+            );
+            assert!(
+                schema.get("$schema").is_none(),
+                "{name} schema keeps $schema"
+            );
+        }
+
+        let function = FunctionInfo {
+            address: "0x1000".into(),
+            name: "_main".into(),
+            size: 32,
+        };
+        let listing = XRefListResult {
+            xrefs: vec![XRefInfo {
+                from: "0x1000".into(),
+                to: "0x2000".into(),
+                r#type: "call".into(),
+                is_code: true,
+            }],
+            truncated: false,
+            next_offset: None,
+        };
+        let results = [
+            (
+                "analysis_status",
+                typed_result(&AnalysisStatusOutput {
+                    status: AnalysisStatus {
+                        auto_enabled: true,
+                        auto_is_ok: true,
+                        auto_state: "idle".into(),
+                        auto_state_id: 0,
+                        analysis_running: false,
+                    },
+                    session_id: Some("s1".into()),
+                }),
+            ),
+            (
+                "list_functions",
+                typed_result(&FunctionListResult {
+                    functions: vec![function.clone()],
+                    total: 1,
+                    next_offset: Some(1),
+                }),
+            ),
+            (
+                "list_functions",
+                typed_result(&FunctionListResult {
+                    functions: vec![],
+                    total: 0,
+                    next_offset: None,
+                }),
+            ),
+            ("resolve_function", typed_result(&function)),
+            (
+                "function_at",
+                typed_result(&FunctionRangeInfo {
+                    address: "0x1000".into(),
+                    name: "_main".into(),
+                    start: "0x1000".into(),
+                    end: "0x1020".into(),
+                    size: 32,
+                }),
+            ),
+            (
+                "xrefs_to",
+                typed_result(&XrefsOutput::Single(listing.clone())),
+            ),
+            (
+                "xrefs_from",
+                typed_result(&XrefsOutput::Batch {
+                    results: vec![
+                        XrefsBatchEntry::Listing {
+                            address: "0x1000".into(),
+                            listing,
+                        },
+                        XrefsBatchEntry::Error {
+                            address: "0x3000".into(),
+                            error: "not found".into(),
+                        },
+                    ],
+                }),
+            ),
+            (
+                "strings",
+                typed_result(&StringListResult {
+                    strings: vec![StringInfo {
+                        address: "0x4000".into(),
+                        content: "hello".into(),
+                        length: 5,
+                    }],
+                    total: 1,
+                    next_offset: None,
+                }),
+            ),
+        ];
+        for (tool, result) in results {
+            let structured = result
+                .structured_content
+                .clone()
+                .expect("structured content");
+            let text: Value = serde_json::from_str(&first_text(&result)).expect("text is JSON");
+            assert_eq!(structured, text, "{tool}: text and structured views differ");
+            let schema = tool_output_schema(tool).expect("schema");
+            let validator = jsonschema::validator_for(&schema).expect("valid schema");
+            let errors: Vec<String> = validator
+                .iter_errors(&structured)
+                .map(|error| error.to_string())
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "{tool} result violates its schema: {errors:?}"
+            );
+        }
+
+        // A batch entry is either a listing or an error, never both or
+        // neither; the schema enforces that, not just the handler.
+        let schema = tool_output_schema("xrefs_to").expect("schema");
+        let validator = jsonschema::validator_for(&schema).expect("valid schema");
+        for invalid in [
+            json!({"results": [{"address": "0x1", "error": "x", "xrefs": [], "truncated": false}]}),
+            json!({"results": [{"address": "0x1"}]}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "schema accepted {invalid}");
+        }
+    }
+
+    /// A server whose worker answers from `respond` on a helper thread, so a
+    /// handler can be driven through a scripted sequence of worker replies.
+    fn scripted_server(
+        respond: impl Fn(crate::IdaRequest) + Send + 'static,
+    ) -> (IdaMcpServer, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let worker = std::thread::spawn(move || {
+            while let Ok(request) = rx.recv() {
+                respond(request);
+            }
+        });
+        let server = IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        );
+        (server, worker)
+    }
+
+    /// A DSC load that succeeds, followed by a status request that reports
+    /// the worker's loss. Any other request is unexpected.
+    fn load_then_lose_worker(request: crate::IdaRequest) {
+        match request {
+            crate::IdaRequest::DscLoadImage {
+                admission, resp, ..
+            } => {
+                let _ = admission.start();
+                let _ = resp.send(Ok(crate::ida::types::DscImageInfo {
+                    index: 1,
+                    name: "/usr/lib/libSystem.B.dylib".to_string(),
+                    file_name: "libSystem.B.dylib".to_string(),
+                    address: "0x180000000".to_string(),
+                    address_value: 0x1_8000_0000,
+                    total_size: 0x1000,
+                    file_index: None,
+                    loaded: true,
+                }));
+            }
+            crate::IdaRequest::DscLoadRegion {
+                admission, resp, ..
+            } => {
+                let _ = admission.start();
+                let _ = resp.send(Ok(crate::ida::types::DscRegionInfo {
+                    start: "0x180000000".to_string(),
+                    start_value: 0x1_8000_0000,
+                    size: 0x1000,
+                    kind: "text".to_string(),
+                    image_index: 1,
+                    name: "libSystem".to_string(),
+                    loaded: true,
+                }));
+            }
+            crate::IdaRequest::AnalysisStatus { resp, .. } => {
+                let _ = resp.send(Err(ToolError::SdkCrashed(
+                    "analysis_status crashed inside the IDA SDK".to_string(),
+                )));
+            }
+            _ => panic!("unexpected worker request"),
+        }
+    }
+
+    fn first_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// The post-load status request is optional, but a fatal error there
+    /// means the database was discarded, so the load must not report success.
+    #[tokio::test]
+    async fn dsc_growth_reports_a_lost_worker_instead_of_success() {
+        let (server, _worker) = scripted_server(load_then_lose_worker);
+
+        let dylib = server
+            .dsc_add_dylib(Parameters(crate::server::DscAddDylibRequest {
+                module: "/usr/lib/libSystem.B.dylib".to_string(),
+                timeout_secs: Some(5),
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(dylib.is_error, Some(true), "{dylib:?}");
+        assert!(first_text(&dylib).contains("crashed inside the IDA SDK"));
+
+        let region = server
+            .dsc_add_region(Parameters(crate::server::DscAddRegionRequest {
+                address: json!("0x180000000"),
+                timeout_secs: Some(5),
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(region.is_error, Some(true), "{region:?}");
+        assert!(first_text(&region).contains("crashed inside the IDA SDK"));
     }
 
     /// Sentinels chosen so a substring hit can only come from the payload we
@@ -8767,7 +9072,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "e665ac0a0c5dc5eae45e24e62a651461f5d9d1322ca99a820230cba790dc89d3"
+            "58e00b524a9c87b10c497ddda07554b9f783a41f3218d3ca5fa4a679c6d09705"
         );
     }
 

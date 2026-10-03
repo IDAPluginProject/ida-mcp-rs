@@ -4,8 +4,8 @@
 //! Compose order (locked semantics, see Phase 2a contract):
 //!
 //! 1. **No include flags** → start from all tools.
-//! 2. **Any `--toolsets` or `--tools`** → start empty, add the union of
-//!    selected categories and selected individual tools.
+//! 2. **Any `--profile`, `--toolsets` or `--tools`** → start empty, add the
+//!    union of the named profile, selected categories and selected tools.
 //! 3. **`--exclude-tools`** → subtract; always wins over any include.
 //! 4. **`--read-only`** → subtract the curated mutating/arbitrary-code
 //!    deny-list; lifecycle/discovery tools stay enabled.
@@ -22,6 +22,7 @@ use crate::tool_registry::{self, ToolCategory};
 /// deliberately preserved so the server stays usable.
 pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "run_script",
+    "save_idb",
     "patch",
     "patch_asm",
     "rename",
@@ -40,8 +41,68 @@ pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "debug_stop",
 ];
 
+/// The `lean` profile: enough to open Apple binaries and caches, read code
+/// and references, annotate, and script, without the long tail of
+/// convenience tools. Discovery tools are left out because the schemas are
+/// already advertised; the instructions adapt to their absence.
+pub const LEAN_PROFILE: &[&str] = &[
+    "open_idb",
+    "open_dsc",
+    "dsc_add_dylib",
+    "dsc_add_region",
+    "load_debug_info",
+    "analysis_status",
+    "analyze_funcs",
+    "save_idb",
+    "close_idb",
+    "task_status",
+    "list_functions",
+    "resolve_function",
+    "function_at",
+    "disasm",
+    "decompile",
+    "xrefs_to",
+    "xrefs_from",
+    "callers",
+    "callees",
+    "strings",
+    "find_bytes",
+    "search",
+    "segments",
+    "imports",
+    "exports",
+    "rename",
+    "set_comments",
+    "run_script",
+];
+
+/// Environment mirrors of the public filter flags. The CLI reads them and a
+/// pool parent scrubs them from child workers, which must keep every tool.
+pub const PROFILE_ENV: &str = "IDA_MCP_PROFILE";
+pub const TOOLSETS_ENV: &str = "IDA_MCP_TOOLSETS";
+pub const TOOLS_ENV: &str = "IDA_MCP_TOOLS";
+pub const EXCLUDE_TOOLS_ENV: &str = "IDA_MCP_EXCLUDE_TOOLS";
+pub const READ_ONLY_ENV: &str = "IDA_MCP_READ_ONLY";
+pub const FILTER_ENV_VARS: &[&str] = &[
+    PROFILE_ENV,
+    TOOLSETS_ENV,
+    TOOLS_ENV,
+    EXCLUDE_TOOLS_ENV,
+    READ_ONLY_ENV,
+];
+
+/// Named tool profiles selectable with `--profile`.
+pub fn profile_tools(name: &str) -> Option<&'static [&'static str]> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "lean" => Some(LEAN_PROFILE),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ToolFilterError {
+    #[error("unknown tool profile: '{0}' (available: lean)")]
+    UnknownProfile(String),
     #[error("unknown toolset category: '{0}' (run `tool_catalog` to list categories)")]
     UnknownToolset(String),
     #[error("unknown tool name: '{0}' (run `tool_catalog` to discover tools)")]
@@ -72,19 +133,41 @@ impl ToolFilter {
         exclude_tools: &[String],
         read_only: bool,
     ) -> Result<Self, ToolFilterError> {
+        Self::from_profile_and_inputs(None, toolsets, tools, exclude_tools, read_only)
+    }
+
+    /// [`Self::from_inputs`] with a named profile as part of the include base.
+    pub fn from_profile_and_inputs(
+        profile: Option<&str>,
+        toolsets: &[String],
+        tools: &[String],
+        exclude_tools: &[String],
+        read_only: bool,
+    ) -> Result<Self, ToolFilterError> {
         let toolsets = clean(toolsets);
         let tools = clean(tools);
         let excludes = clean(exclude_tools);
+        let profile = profile.map(str::trim).filter(|name| !name.is_empty());
 
-        let any_input =
-            !toolsets.is_empty() || !tools.is_empty() || !excludes.is_empty() || read_only;
+        let any_input = profile.is_some()
+            || !toolsets.is_empty()
+            || !tools.is_empty()
+            || !excludes.is_empty()
+            || read_only;
 
         // Step 1/2: build the include base.
-        let mut enabled: HashSet<&'static str> = if toolsets.is_empty() && tools.is_empty() {
-            tool_registry::all_tools().map(|t| t.name).collect()
-        } else {
-            HashSet::new()
-        };
+        let mut enabled: HashSet<&'static str> =
+            if profile.is_none() && toolsets.is_empty() && tools.is_empty() {
+                tool_registry::all_tools().map(|t| t.name).collect()
+            } else {
+                HashSet::new()
+            };
+
+        if let Some(name) = profile {
+            let members = profile_tools(name)
+                .ok_or_else(|| ToolFilterError::UnknownProfile(name.to_string()))?;
+            enabled.extend(members.iter().copied());
+        }
 
         for raw in &toolsets {
             let cat = ToolCategory::from_str(raw)
@@ -190,7 +273,9 @@ fn clean(input: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::server::tool_filter::{ToolFilter, ToolFilterError, READ_ONLY_DENY_LIST};
+    use crate::server::tool_filter::{
+        ToolFilter, ToolFilterError, LEAN_PROFILE, READ_ONLY_DENY_LIST,
+    };
     use crate::tool_registry;
 
     fn cat(s: &str) -> Vec<String> {
@@ -321,6 +406,63 @@ mod tests {
         ] {
             assert!(f.is_enabled(name), "read-only must keep {name}");
         }
+    }
+
+    #[test]
+    fn lean_profile_is_a_registered_apple_oriented_subset() {
+        let f = ToolFilter::from_profile_and_inputs(Some("lean"), &[], &[], &[], false).unwrap();
+        assert!(f.is_active());
+        for name in LEAN_PROFILE {
+            assert!(
+                tool_registry::get_tool(name).is_some(),
+                "lean profile names unregistered tool {name}"
+            );
+            assert!(f.is_enabled(name));
+        }
+        assert_eq!(f.enabled_count(), LEAN_PROFILE.len());
+        assert_eq!(LEAN_PROFILE.len(), 28);
+        for name in [
+            "open_dsc",
+            "dsc_add_dylib",
+            "decompile",
+            "run_script",
+            "save_idb",
+        ] {
+            assert!(f.is_enabled(name), "lean must keep {name}");
+        }
+        for name in [
+            "tool_catalog",
+            "tool_help",
+            "read_int",
+            "lumina_apply",
+            "patch_asm",
+        ] {
+            assert!(!f.is_enabled(name), "lean must not include {name}");
+        }
+    }
+
+    #[test]
+    fn profile_composes_with_the_other_inputs() {
+        let f = ToolFilter::from_profile_and_inputs(
+            Some("lean"),
+            &[],
+            &cat("patch"),
+            &cat("run_script"),
+            true,
+        )
+        .unwrap();
+        assert!(f.is_enabled("decompile")); // from profile
+        assert!(!f.is_enabled("patch")); // added, then stripped by read-only
+        assert!(!f.is_enabled("run_script")); // excluded
+        assert!(!f.is_enabled("rename")); // profile member stripped by read-only
+        assert!(f.is_enabled("open_idb"));
+    }
+
+    #[test]
+    fn unknown_profile_rejected() {
+        let err = ToolFilter::from_profile_and_inputs(Some("tiny"), &[], &[], &[], false)
+            .expect_err("must reject unknown profile");
+        assert_eq!(err, ToolFilterError::UnknownProfile("tiny".into()));
     }
 
     #[test]

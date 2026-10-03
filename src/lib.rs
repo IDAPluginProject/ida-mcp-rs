@@ -29,7 +29,6 @@
 //!
 //! ## Function Analysis
 //! - `list_functions`: List all functions (paginated)
-//! - `list_funcs`: Alias for list_functions (ida-pro-mcp compatibility)
 //! - `resolve_function`: Find a function by name
 //! - `function_at`: Find the function containing an address
 //! - `lookup_funcs`: Batch lookup by name/address (ida-pro-mcp compatibility)
@@ -66,12 +65,11 @@
 //!
 //! ## Memory
 //! - `get_bytes`: Read raw bytes from an address
-//! - `get_u8/get_u16/get_u32/get_u64`: Read integer values
+//! - `read_int`: Read unsigned integers of 1, 2, 4, or 8 bytes
 //! - `get_string`: Read string at address
 //! - `get_global_value`: Resolve global name/address and read value
 //! - `find_bytes`: Find byte patterns
 //! - `search`: Search text or immediates
-//! - `int_convert`: Convert integers between bases
 //!
 //! ## Headless limitations
 //! Debugger/UI/scripting features are not exposed in headless mode.

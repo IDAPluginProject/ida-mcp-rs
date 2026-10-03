@@ -294,4 +294,82 @@ grep -q "tool filter resolves to an empty set" "$work/workspace-required.log" ||
 }
 echo "   ✓ workspace requirement participates in the final-set check"
 
+# --- Phase F: --profile lean ---
+echo "── Phase F: --profile lean advertises the lean set and adapts instructions ──"
+start_server --profile lean
+send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"filter-test","version":"0.1"},"capabilities":{}}}'
+send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+init_resp=$(wait_response 1 10)
+if echo "$init_resp" | jq -r '.result.instructions' | grep -q 'tool_catalog'; then
+  echo "FAIL: lean instructions still mention the hidden tool_catalog" >&2
+  exit 1
+fi
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+lean_names=$(wait_response 2 10 | jq -r '.result.tools[].name' | sort)
+lean_count=$(echo "$lean_names" | grep -c .)
+[[ "$lean_count" == "28" ]] || { echo "FAIL: lean profile should expose 28 tools, got $lean_count" >&2; exit 1; }
+for name in open_idb open_dsc dsc_add_dylib decompile xrefs_to run_script save_idb; do
+  echo "$lean_names" | grep -q "^${name}$" || { echo "FAIL: lean profile missing $name" >&2; exit 1; }
+done
+for name in tool_catalog read_int patch_asm lumina_apply; do
+  if echo "$lean_names" | grep -q "^${name}$"; then
+    echo "FAIL: lean profile should not expose $name" >&2; exit 1
+  fi
+done
+cleanup_stale_pid
+echo "   ✓ lean profile exposes 28 tools and filter-aware instructions"
+
+echo "── Phase F2: IDA_MCP_PROFILE env mirror composes with --read-only ──"
+IDA_MCP_PROFILE=lean start_server --read-only
+initialize
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+ro_names=$(wait_response 2 10 | jq -r '.result.tools[].name' | sort)
+echo "$ro_names" | grep -q '^decompile$' || { echo "FAIL: lean+read-only lost decompile" >&2; exit 1; }
+for name in run_script rename save_idb; do
+  if echo "$ro_names" | grep -q "^${name}$"; then
+    echo "FAIL: lean+read-only should strip $name" >&2; exit 1
+  fi
+done
+cleanup_stale_pid
+echo "   ✓ profile env var composes with --read-only"
+
+if "$BIN" serve --profile tiny < /dev/null > "$work/bad-profile.log" 2>&1; then
+  echo "FAIL: startup should reject an unknown profile" >&2
+  exit 1
+fi
+grep -q "unknown tool profile" "$work/bad-profile.log" || {
+  echo "FAIL: error should mention 'unknown tool profile'; got: $(cat "$work/bad-profile.log")" >&2
+  exit 1
+}
+echo "   ✓ unknown profile rejected at startup"
+
+# --- Phase G: the profile env var must not reach private child workers ---
+echo "── Phase G: IDA_MCP_PROFILE stays with the public server, not workspace children ──"
+work_idb="$work/lean-worker.i64"
+cp "${IDB_PATH:-fixtures/mini.i64}" "$work_idb"
+IDA_MCP_PROFILE=lean start_server --workspace --tools get_bytes
+initialize
+send "$(jq -cn --arg path "$work_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$path}}}')"
+open_resp=$(wait_response 2 120)
+open_text=$(echo "$open_resp" | text)
+db_id=$(echo "$open_text" | jq -r '.database_id // empty')
+[[ -n "$db_id" ]] || { echo "FAIL: workspace open_idb returned no database_id" >&2; echo "$open_resp" >&2; exit 1; }
+if echo "$open_text" | jq -e '.quick_tools | index("disasm_by_name")' >/dev/null; then
+  echo "FAIL: open_idb recommended disasm_by_name, which the lean profile hides" >&2
+  exit 1
+fi
+echo "$open_text" | jq -e '.quick_tools | index("list_functions")' >/dev/null || {
+  echo "FAIL: open_idb quick_tools lost an enabled tool" >&2; exit 1; }
+send "$(jq -cn --arg id "$db_id" \
+  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"get_bytes",arguments:{database_id:$id,address:"0x100000000",size:4}}}')"
+bytes_resp=$(wait_response 3 30)
+if echo "$bytes_resp" | jq -e '.result.isError == true or has("error")' >/dev/null; then
+  echo "FAIL: get_bytes added with --tools was rejected through the workspace child" >&2
+  echo "$bytes_resp" >&2
+  exit 1
+fi
+cleanup_stale_pid
+echo "   ✓ added tool works through a child worker; quick_tools respects the profile"
+
 echo "✅ stdio tool-filter test passed"

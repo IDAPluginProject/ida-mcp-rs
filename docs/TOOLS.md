@@ -5,7 +5,7 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns 75 baseline tools by default (82 registered including opt-in workspace and debugger tools)
+- `tools/list` returns 71 baseline tools by default (78 registered including opt-in workspace and debugger tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`
@@ -35,6 +35,7 @@ Database open/close and discovery tools
 | `open_dsc` | Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more |
 | `open_idb` | Open an IDA database or raw binary |
 | `recent_operations` | Inspect recent foreground operation history |
+| `save_idb` | Save the open database without closing it |
 | `task_status` | Check status of a background task (e.g. DSC loading) |
 | `tool_catalog` | Discover available tools by query or category |
 | `tool_help` | Get full documentation for a tool |
@@ -47,7 +48,6 @@ List, search, and resolve functions
 |------|-------------|
 | `analyze_funcs` | Run auto-analysis (foreground or background task) |
 | `function_at` | Find the function containing an address |
-| `list_funcs` | Alias of list_functions |
 | `list_functions` | List functions with pagination and filtering |
 | `lookup_funcs` | Batch lookup multiple functions by name |
 | `resolve_function` | Find function address by name |
@@ -105,11 +105,7 @@ Read bytes, strings, and data
 | `get_bytes` | Read raw bytes from an address |
 | `get_global_value` | Read global value by name or address |
 | `get_string` | Read string at an address |
-| `get_u16` | Read 16-bit value |
-| `get_u32` | Read 32-bit value |
-| `get_u64` | Read 64-bit value |
-| `get_u8` | Read 8-bit value |
-| `int_convert` | Convert integers between bases |
+| `read_int` | Read unsigned integers of a given byte width |
 
 ## Search (`search`)
 

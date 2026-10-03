@@ -46,3 +46,6 @@ windows-sys = { version = "0.61", features = [
 [build-dependencies]
 cc = "1"
 idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.5", package = "idalib-build" }
+
+[dev-dependencies]
+jsonschema = { version = "0.58.5", default-features = false }

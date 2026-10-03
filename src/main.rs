@@ -15,7 +15,7 @@ use ida_mcp::server::http_config::{
     HttpServerOptions, DEFAULT_MAX_REQUEST_BODY_MIB,
 };
 use ida_mcp::server::task::TaskRegistry;
-use ida_mcp::server::tool_filter::ToolFilter;
+use ida_mcp::server::tool_filter::{self, ToolFilter};
 use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
 use ida_mcp::{
     disasm::generate_disasm_line,
@@ -142,19 +142,24 @@ enum Command {
 #[derive(Args, Debug, Clone, Default)]
 #[command(next_help_heading = "Tool filter")]
 struct ToolFilterArgs {
+    /// Named tool profile to start from. `lean` is 28 tools covering Apple
+    /// loading, code/xref reading, annotation, and scripting; --toolsets and
+    /// --tools add to it, --exclude-tools and --read-only subtract.
+    #[arg(long, env = tool_filter::PROFILE_ENV, global = true)]
+    profile: Option<String>,
     /// Categories to include (comma-separated). When set, replaces the
     /// implicit "all tools" default. Example: --toolsets=disassembly,decompile
-    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLSETS", global = true)]
+    #[arg(long, value_delimiter = ',', env = tool_filter::TOOLSETS_ENV, global = true)]
     toolsets: Vec<String>,
     /// Individual tool names to include (additive to --toolsets).
     /// Example: --tools=open_idb,decompile,callees
-    #[arg(long, value_delimiter = ',', env = "IDA_MCP_TOOLS", global = true)]
+    #[arg(long, value_delimiter = ',', env = tool_filter::TOOLS_ENV, global = true)]
     tools: Vec<String>,
     /// Tool names to exclude (always wins over includes).
     #[arg(
         long,
         value_delimiter = ',',
-        env = "IDA_MCP_EXCLUDE_TOOLS",
+        env = tool_filter::EXCLUDE_TOOLS_ENV,
         global = true
     )]
     exclude_tools: Vec<String>,
@@ -163,7 +168,7 @@ struct ToolFilterArgs {
     /// tools (open_idb, close_idb, status, catalog, help) stay enabled.
     #[arg(
         long,
-        env = "IDA_MCP_READ_ONLY",
+        env = tool_filter::READ_ONLY_ENV,
         global = true,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
@@ -172,7 +177,8 @@ struct ToolFilterArgs {
 
 impl ToolFilterArgs {
     fn build(&self, debugger_enabled: bool, workspace_enabled: bool) -> Result<ToolFilter, String> {
-        ToolFilter::from_inputs(
+        ToolFilter::from_profile_and_inputs(
+            self.profile.as_deref(),
             &self.toolsets,
             &self.tools,
             &self.exclude_tools,
@@ -366,25 +372,34 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Waits for a shutdown signal and logs which one arrived, so a receipt can
+/// tell a client's hangup from an explicit terminate.
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
+        // SIGHUP included: an MCP client that exits can hang up its stdio
+        // children, and an unhandled hangup kills the process before IDA
+        // packs the open database.
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigquit = signal(SignalKind::quit())?;
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
-            _ = sigquit.recv() => {},
-            _ = tokio::signal::ctrl_c() => {},
-        }
+        let mut sighup = signal(SignalKind::hangup())?;
+        let received = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+            _ = sigquit.recv() => "SIGQUIT",
+            _ = sighup.recv() => "SIGHUP",
+            _ = tokio::signal::ctrl_c() => "ctrl-c",
+        };
+        info!(signal = received, "Shutdown signal received");
     }
 
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await?;
+        info!(signal = "ctrl-c", "Shutdown signal received");
     }
 
     Ok(())
@@ -458,7 +473,7 @@ fn run_server_workspace(
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let (pool, registry) = workspace.build_pool_and_registry(worker_args)?;
         let server = IdaMcpServer::with_workspace_and_state(
             registry.clone(),
@@ -499,7 +514,11 @@ fn run_server_workspace(
         registry.shutdown().await;
         pool.shutdown_all().await;
         Ok::<_, anyhow::Error>(())
-    })
+    });
+    // A signal-driven shutdown can leave the stdin reader blocked on a client
+    // that never closed its end; do not let it pin the process.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 fn run_server_with_mode(
@@ -514,6 +533,8 @@ fn run_server_with_mode(
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = IdaWorker::new(tx);
     let backend = WorkerBackend::local(Arc::new(worker.clone()));
+    let sdk_crash = ida_mcp::crash_guard::SdkCrashSignal::default();
+    let sdk_crash_for_server = sdk_crash.clone();
 
     // Spawn background thread for tokio runtime and MCP server
     let worker_for_server = backend.clone();
@@ -526,7 +547,7 @@ fn run_server_with_mode(
             .build()
             .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
 
-        rt.block_on(async move {
+        let result = rt.block_on(async move {
             info!("MCP server listening on stdio");
             let server = IdaMcpServer::with_filter(
                 worker_for_server,
@@ -535,6 +556,10 @@ fn run_server_with_mode(
             );
             let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
+            let sanitized = match mode {
+                ServerMode::Worker => sanitized.reporting_sdk_crashes(sdk_crash_for_server),
+                ServerMode::Stdio | ServerMode::Http => sanitized,
+            };
             let mut service = match sanitized.serve(stdio()).await {
                 Ok(running) => Some(running),
                 Err(e) => {
@@ -553,7 +578,6 @@ fn run_server_with_mode(
             let shutdown_tasks = task_registry.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
-                    info!("Shutdown signal received");
                     cancel_background_tasks(
                         &shutdown_tasks,
                         "Cancelled by server shutdown",
@@ -602,12 +626,16 @@ fn run_server_with_mode(
             info!("MCP server shutting down");
             shutdown_worker_bounded(&worker_for_shutdown).await;
             Ok::<_, anyhow::Error>(())
-        })
+        });
+        // A signal-driven shutdown can leave the stdin reader blocked on a
+        // client that never closed its end; do not let it pin the process.
+        rt.shutdown_timeout(Duration::from_secs(2));
+        result
     });
 
     // Run IDA worker loop on the main thread after startup preflight.
     info!("Starting IDA worker loop");
-    ida::run_ida_loop(rx, init_state);
+    ida::run_ida_loop(rx, init_state, sdk_crash);
     info!("IDA worker loop finished");
 
     // Wait for server thread to finish
@@ -758,7 +786,6 @@ fn run_server_http(
             let cancel_for_shutdown = cancel.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
-                    info!("Shutdown signal received");
                     let _ = shutdown_worker.close_for_shutdown().await;
                     let _ = shutdown_worker.shutdown().await;
                     cancel_for_shutdown.cancel();
@@ -786,7 +813,11 @@ fn run_server_http(
     });
 
     info!("Starting IDA worker loop");
-    ida::run_ida_loop(rx, init_state);
+    ida::run_ida_loop(
+        rx,
+        init_state,
+        ida_mcp::crash_guard::SdkCrashSignal::default(),
+    );
     info!("IDA worker loop finished");
 
     // Propagate startup/serve failures into the exit status so supervisors can
@@ -910,7 +941,6 @@ fn run_server_http_pooled(
             let registry_for_shutdown = workspace_registry.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
-                    info!("Shutdown signal received");
                     cancel_for_shutdown.cancel();
                     registry_for_shutdown.shutdown().await;
                     pool_for_shutdown.shutdown_all().await;

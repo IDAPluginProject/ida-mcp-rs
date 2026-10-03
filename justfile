@@ -252,6 +252,10 @@ test-dsc dsc_path="": build
 test-license: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=info just test-license
 
+# Verify a shutdown signal saves the database and exits with stdin still open (debug)
+test-shutdown-signal: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-shutdown-signal
+
 # Run crash-guard integration test (triggers SIGSEGV, verifies server survives)
 test-crash-guard: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-crash-guard

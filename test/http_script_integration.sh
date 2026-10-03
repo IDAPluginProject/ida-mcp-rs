@@ -126,6 +126,87 @@ echo "$syntax_resp" | grep -q 'IDAPython script execution failed' || {
   exit 1
 }
 
+define_resp="$(call_tool 8 run_script "{\"code\":\"import ida_funcs\\npersisted_count = ida_funcs.get_func_qty()\"}")"
+echo "$define_resp" | grep -q 'success\\": true' || {
+  echo "script defining a global failed" >&2
+  echo "$define_resp" >&2
+  exit 1
+}
+
+result_resp="$(call_tool 9 run_script "{\"code\":\"{'count': persisted_count, 'kind': 'trailing'}\"}")"
+echo "$result_resp" | grep -q 'kind\\": \\"trailing' || {
+  echo "trailing expression was not returned as result, or globals did not persist" >&2
+  echo "$result_resp" >&2
+  exit 1
+}
+
+none_resp="$(call_tool 10 run_script "{\"code\":\"print('no_result_ok')\"}")"
+if echo "$none_resp" | grep -q '\\"result\\"'; then
+  echo "a None trailing expression must not produce a result field" >&2
+  echo "$none_resp" >&2
+  exit 1
+fi
+
+big_resp="$(call_tool 13 run_script "{\"code\":\"{'payload': 'x' * (1024 * 1024)}\"}")"
+echo "$big_resp" | grep -q '"isError":true' || {
+  echo "an oversized result must fail instead of being truncated" >&2
+  echo "$big_resp" | cut -c1-400 >&2
+  exit 1
+}
+echo "$big_resp" | grep -q 'over the 1 MiB limit' || {
+  echo "oversized result error does not explain the limit" >&2
+  echo "$big_resp" | cut -c1-400 >&2
+  exit 1
+}
+
+nan_resp="$(call_tool 14 run_script "{\"code\":\"{'value': float('nan')}\"}")"
+echo "$nan_resp" | grep -q 'result_is_repr\\": true' || {
+  echo "a non-finite result must be flagged as a repr() fallback" >&2
+  echo "$nan_resp" >&2
+  exit 1
+}
+
+for big in "2**64 + 1" "-(2**63) - 1" "10**400" "[1, {'nested': 2**70}]"; do
+  big_int_resp="$(call_tool 16 run_script "{\"code\":\"$big\"}")"
+  echo "$big_int_resp" | grep -q 'result_is_repr\\": true' || {
+    echo "integer outside the 64-bit range must use the repr() fallback: $big" >&2
+    echo "$big_int_resp" >&2
+    exit 1
+  }
+done
+exact_resp="$(call_tool 17 run_script "{\"code\":\"[2**63, -(2**63), 2**64 - 1]\"}")"
+echo "$exact_resp" | grep -q '9223372036854775808' || {
+  echo "64-bit integers must round-trip exactly" >&2
+  echo "$exact_resp" >&2
+  exit 1
+}
+if echo "$exact_resp" | grep -q 'result_is_repr'; then
+  echo "64-bit integers must not use the repr() fallback" >&2
+  echo "$exact_resp" >&2
+  exit 1
+fi
+
+plain_resp="$(call_tool 15 run_script "{\"code\":\"[1, 2, 3]\"}")"
+if echo "$plain_resp" | grep -q 'result_is_repr'; then
+  echo "a JSON-serializable result must not be flagged as repr()" >&2
+  echo "$plain_resp" >&2
+  exit 1
+fi
+
+save_resp="$(call_tool 11 save_idb "{}")"
+echo "$save_resp" | grep -q 'saved\\": true' || {
+  echo "save_idb failed" >&2
+  echo "$save_resp" >&2
+  exit 1
+}
+
+after_save_resp="$(call_tool 12 run_script "{\"code\":\"persisted_count\"}")"
+echo "$after_save_resp" | grep -q '\\"result\\"' || {
+  echo "database was not usable after save_idb" >&2
+  echo "$after_save_resp" >&2
+  exit 1
+}
+
 close_token="$(echo "$open_resp" | sed -n 's/.*\\\"close_token\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p')"
 if [[ -n "$close_token" ]]; then
   close_args="{\"close_token\":\"$close_token\"}"

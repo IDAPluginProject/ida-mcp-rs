@@ -329,6 +329,20 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["analysis", "autoanalysis", "status", "xrefs", "decompile"],
     },
     ToolInfo {
+        name: "save_idb",
+        category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Save the open database without closing it",
+        full_desc: "Write the open database to its .i64/.idb path and keep it open; \
+                    returns that path. \
+                    Use it to checkpoint renames, comments, types, and patches before \
+                    risky operations; close_idb also saves.",
+        example: r#"{}"#,
+        default: true,
+        keywords: &["save", "checkpoint", "persist", "write", "database"],
+    },
+    ToolInfo {
         name: "close_idb",
         category: ToolCategory::Core,
         scope: ToolScope::Database,
@@ -436,18 +450,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
             "filter",
             "subroutines",
         ],
-    },
-    ToolInfo {
-        name: "list_funcs",
-        category: ToolCategory::Functions,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Alias of list_functions",
-        full_desc: "Alias of list_functions. Lists all functions in the database with pagination \
-                    and optional name filtering.",
-        example: r#"{"offset": 0, "limit": 100, "filter": "init"}"#,
-        default: false,
-        keywords: &["functions", "list", "alias"],
     },
     ToolInfo {
         name: "resolve_function",
@@ -727,48 +729,16 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["string", "read", "text", "ascii", "data"],
     },
     ToolInfo {
-        name: "get_u8",
+        name: "read_int",
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 8-bit value",
-        full_desc: "Read an unsigned 8-bit value (byte) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
+        short_desc: "Read unsigned integers of a given byte width",
+        full_desc: "Read an unsigned integer at each address. size is the width in bytes \
+                    (1, 2, 4, or 8) and the value is read in the database's byte order.",
+        example: r#"{"address": "0x1000", "size": 4}"#,
         default: false,
-        keywords: &["byte", "u8", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u16",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 16-bit value",
-        full_desc: "Read an unsigned 16-bit value (word) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["word", "u16", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u32",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 32-bit value",
-        full_desc: "Read an unsigned 32-bit value (dword) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["dword", "u32", "read", "value"],
-    },
-    ToolInfo {
-        name: "get_u64",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Database,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Read 64-bit value",
-        full_desc: "Read an unsigned 64-bit value (qword) at the specified address.",
-        example: r#"{"address": "0x1000"}"#,
-        default: false,
-        keywords: &["qword", "u64", "read", "value"],
+        keywords: &["u8", "u16", "u32", "u64", "byte", "word", "dword", "qword", "read", "value"],
     },
     ToolInfo {
         name: "get_global_value",
@@ -780,17 +750,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"query": "g_flag"}"#,
         default: false,
         keywords: &["global", "value", "read", "symbol", "data"],
-    },
-    ToolInfo {
-        name: "int_convert",
-        category: ToolCategory::Memory,
-        scope: ToolScope::Runtime,
-        requirements: ToolRequirements::BASELINE,
-        short_desc: "Convert integers between bases",
-        full_desc: "Convert integers between decimal/hex/binary and show ASCII bytes when possible.",
-        example: r#"{"inputs": ["0x41424344", 1234]}"#,
-        default: false,
-        keywords: &["int", "convert", "hex", "decimal", "ascii"],
     },
     // === SEARCH ===
     ToolInfo {
@@ -1287,7 +1246,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         full_desc: "Execute a Python script via IDAPython in the currently open database. \
                     Provide either 'code' (inline Python) or 'file' (path to a .py file). \
                     Has full access to all ida_* modules (ida_funcs, ida_bytes, ida_segment, etc.), \
-                    idc, and idautils. stdout and stderr are captured and returned. \
+                    idc, and idautils. stdout and stderr are captured and returned, and a \
+                    trailing expression is returned as `result`: strict JSON up to 1 MiB, or the \
+                    string of its repr() with result_is_repr=true when it is not JSON-serializable \
+                    or holds an integer outside the 64-bit range (a larger result fails the call). \
+                    Imports, variables, and functions persist between calls on the same \
+                    open database. \
                     Use this for custom analysis that goes beyond the built-in tools. \
                     Supports timeout_secs, records phase transitions in recent_operations, \
                     and requires that the IDAPython plugin is loaded (available by default in IDA Pro). \
@@ -1464,7 +1428,6 @@ mod tests {
                 "tool_help",
                 "recent_operations",
                 "task_status",
-                "int_convert",
                 "debug_status",
                 "list_databases",
             ])

@@ -52,17 +52,6 @@ pub struct WorkerPoolConfig {
     pub worker_args: Vec<OsString>,
 }
 
-/// Public tool-filter environment variables. Filtering is enforced by the
-/// parent HTTP server; private child workers must keep lifecycle/internal
-/// tools such as `close_idb` and `analyze_funcs` available for the parent,
-/// so these are stripped from the child environment.
-const CHILD_FILTER_ENV_VARS: &[&str] = &[
-    "IDA_MCP_TOOLSETS",
-    "IDA_MCP_TOOLS",
-    "IDA_MCP_EXCLUDE_TOOLS",
-    "IDA_MCP_READ_ONLY",
-];
-
 #[derive(Clone)]
 pub struct WorkerPool {
     inner: Arc<Mutex<PoolInner>>,
@@ -457,7 +446,7 @@ impl WorkerPool {
         let mut cmd = tokio::process::Command::new(&self.config.exe_path);
         cmd.args(&self.config.worker_args);
         cmd.arg("worker");
-        for var in CHILD_FILTER_ENV_VARS {
+        for var in crate::server::tool_filter::FILTER_ENV_VARS {
             cmd.env_remove(var);
         }
         cmd.kill_on_drop(true);
@@ -848,6 +837,11 @@ impl PooledWorkerHandle {
 
         match result {
             Ok(Ok(result)) => {
+                if let Some(err) = remote::sdk_crash(&result, tool) {
+                    self.pool.mark_dead(&self.slot).await;
+                    retire_guard.disarm();
+                    return Err(err);
+                }
                 if tracks_open
                     && let Some(err) = remote::result_error(&result, tool)
                     && unsettled_open_error_retires_worker(&err)
@@ -2942,24 +2936,17 @@ impl WorkspaceDatabase {
     }
 
     pub async fn read_int(&self, addr: u64, size: usize) -> Result<Value, ToolError> {
-        let tool = match size {
-            1 => "get_u8",
-            2 => "get_u16",
-            4 => "get_u32",
-            8 => "get_u64",
-            _ => {
-                return Err(ToolError::InvalidParams(format!(
-                    "unsupported integer size: {size}"
-                )));
-            }
-        };
         self.call_value(
-            tool,
-            json!({ "address": remote::hex_addr(addr) }),
+            "read_int",
+            json!({ "address": remote::hex_addr(addr), "size": size }),
             None,
             None,
         )
         .await
+    }
+
+    pub async fn save_database(&self) -> Result<Value, ToolError> {
+        self.call_value("save_idb", json!({}), None, None).await
     }
 
     pub async fn get_string(&self, addr: u64, max_len: usize) -> Result<Value, ToolError> {
@@ -3248,6 +3235,7 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
             | ToolError::Cancelled(_)
             | ToolError::DebuggerTeardown(_)
             | ToolError::WorkerCrashed { .. }
+            | ToolError::SdkCrashed(_)
             | ToolError::RemoteProtocol(_)
             | ToolError::WorkerClosed
     )
@@ -3256,7 +3244,10 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
 fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
     if matches!(
         err,
-        ToolError::WorkerClosed | ToolError::WorkerCrashed { .. } | ToolError::RemoteProtocol(_)
+        ToolError::WorkerClosed
+            | ToolError::WorkerCrashed { .. }
+            | ToolError::SdkCrashed(_)
+            | ToolError::RemoteProtocol(_)
     ) {
         return true;
     }
@@ -3273,6 +3264,7 @@ fn unsettled_open_error_retires_worker(err: &ToolError) -> bool {
         ToolError::Timeout(_)
             | ToolError::TimeoutDetailed(_)
             | ToolError::Cancelled(_)
+            | ToolError::SdkCrashed(_)
             | ToolError::WorkerClosed
     )
 }
@@ -3285,6 +3277,7 @@ fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
                 | ToolError::TimeoutDetailed(_)
                 | ToolError::Cancelled(_)
                 | ToolError::WorkerCrashed { .. }
+                | ToolError::SdkCrashed(_)
                 | ToolError::WorkerClosed
         )
 }
@@ -3646,6 +3639,18 @@ mod tests {
         );
         assert!(matches!(crashed, ToolError::DebuggerSessionLost(_)));
 
+        // An SDK crash on a debug-pinned worker is reported as a lost session;
+        // it must stay fatal so batch and optional-status handlers surface it.
+        let sdk_crash = debugger_worker_loss_error(
+            "search",
+            ToolError::SdkCrashed("search crashed inside the IDA SDK".to_string()),
+            true,
+        );
+        assert!(
+            matches!(&sdk_crash, ToolError::DebuggerSessionLost(message) if message.contains("search"))
+        );
+        assert!(sdk_crash.is_fatal());
+
         // No debugger session: the original error survives unchanged.
         let plain = debugger_worker_loss_error(
             "run_script",
@@ -3698,12 +3703,15 @@ mod tests {
             .filter_map(|(key, _)| key.to_str())
             .collect();
 
-        for var in crate::ida::pool::CHILD_FILTER_ENV_VARS {
+        // The CLI reads its filter flags from these same constants, so a
+        // variable the CLI honors cannot be missing from the scrub list.
+        for var in crate::server::tool_filter::FILTER_ENV_VARS {
             assert!(
                 cleared.contains(var),
                 "pooled child workers must not inherit {var}; they need lifecycle tools"
             );
         }
+        assert!(cleared.contains(&crate::server::tool_filter::PROFILE_ENV));
     }
 
     #[test]
@@ -3912,6 +3920,10 @@ mod tests {
         assert!(child_tool_error_retires_worker(
             "run_script",
             &ToolError::WorkerClosed
+        ));
+        assert!(child_tool_error_retires_worker(
+            "decompile",
+            &ToolError::SdkCrashed("decompile crashed inside the IDA SDK".to_string())
         ));
     }
 

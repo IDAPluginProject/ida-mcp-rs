@@ -1337,6 +1337,13 @@ impl IdaWorker {
         rx.await?
     }
 
+    /// Write the open database to disk without closing it.
+    pub async fn save_database(&self) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::SaveDatabase { resp: tx })?;
+        rx.await?
+    }
+
     /// Read string at address.
     pub async fn get_string(&self, addr: u64, max_len: usize) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -2516,6 +2523,13 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => worker.read_int(addr, size).await,
             Self::Pooled(state) => state.read_int(addr, size).await,
+        }
+    }
+
+    pub async fn save_database(&self) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.save_database().await,
+            Self::Pooled(state) => state.save_database().await,
         }
     }
 
