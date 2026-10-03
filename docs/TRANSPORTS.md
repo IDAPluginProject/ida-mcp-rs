@@ -4,8 +4,12 @@
 
 - Single-client, simplest setup.
 - Use with CLI agents that launch a child process.
-- Uses one implicit database by default. Add `--workspace` when an agent needs
-  several explicit database handles in one stdio connection.
+- Uses one implicit database by default, served by one supervised IDA child
+  process: a call that overruns its bound kills the child (the database is
+  no longer open; reopen it) and the next open starts a fresh one. Idle
+  reaping is off in this mode; `--workspace-worker-op-timeout-secs` sets the
+  watchdog. Add `--workspace` when an agent needs several explicit database
+  handles in one stdio connection.
 
 ```bash
 ./target/release/ida-mcp
@@ -156,8 +160,8 @@ Runtime tools such as `tool_catalog` do not accept a database ID.
 ## Concurrency model
 
 IDA requires main-thread access, and one IDA process can own only one active
-database at a time. The default stdio and single-worker HTTP modes therefore
-serialize calls through one worker loop.
+database at a time. The default stdio mode serializes calls through one child
+worker; single-worker HTTP serializes them through one in-process worker loop.
 
 With `--workspace`, each open database owns a child-worker lease addressed by
 its `database_id`. Calls to different handles can run concurrently up to

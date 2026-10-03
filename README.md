@@ -21,7 +21,7 @@
   calls with explicit parameters, not scripts the agent has to write. In a
   measured Claude Code run, selecting and analyzing the x86_64 slice of a
   universal binary took one call and about five seconds.
-- **Fast and lean.** A native Rust server driving IDA in-process; a 28-tool
+- **Fast and lean.** A native Rust server driving IDA through idalib; a 28-tool
   `--profile=lean` measured 25% cheaper than the full set on real tasks with
   the same correctness, and the full set is there when you need it.
 - **Safe to leave running.** Exact-target edits, `save_idb` checkpoints,
@@ -383,10 +383,15 @@ per-item failures) and then stops using that database state: the database is clo
 without saving, so changes since the last `save_idb` are lost, and pooled or
 workspace child workers are replaced. Call `open_idb` again to continue.
 
-The default stdio server and single-worker HTTP host IDA in the server process
-itself, so after a crash they keep running in a process whose native state may
-be damaged. Pooled HTTP (`--max-workers N`) and `--workspace` run IDA in child
-processes that are killed and replaced instead.
+The default stdio server runs IDA in one supervised child process (the same
+binary in `worker` mode), as pooled HTTP (`--max-workers N`) and `--workspace`
+do. A call that overruns its `timeout_secs` (or the 1800 s operation watchdog,
+`--workspace-worker-op-timeout-secs`) kills that child and returns a timeout:
+the database is then no longer open, changes since the last `save_idb` are
+lost, and the next `open_idb` starts a fresh worker. This is what makes a
+native IDA call that never returns recoverable; nothing can interrupt it in
+place. Single-worker HTTP still hosts IDA in the server process and keeps
+running after a crash in a process whose native state may be damaged.
 
 ### Removed tools
 

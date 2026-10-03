@@ -6,15 +6,17 @@
 //!
 //! # Architecture
 //!
-//! IDA **must** run on the main thread. The architecture is:
+//! IDA **must** run on the main thread of the process that hosts it. The
+//! architecture is:
 //!
-//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop`).
-//!   All idalib operations happen here.
+//! - **Worker process** (`ida-mcp worker`, also single-worker HTTP): the main
+//!   thread runs the IDA worker loop (`ida::run_ida_loop`); all idalib
+//!   operations happen there. A background thread runs the tokio runtime with
+//!   the MCP server and talks to the main thread via channels (`IdaWorker`).
 //!
-//! - **Background thread**: Runs the tokio runtime with the async MCP server.
-//!   Communicates with the main thread via channels.
-//!
-//! - **IdaWorker**: Handle for sending requests to the main thread.
+//! - **Router process** (default stdio, `--workspace`, pooled HTTP): no IDA;
+//!   it supervises worker processes through `ida::pool` and kills one whose
+//!   call overruns its bound.
 //!
 //! - **IdaMcpServer**: The MCP server that exposes tools for IDA operations.
 //!   Uses the `rmcp` crate for MCP protocol handling.

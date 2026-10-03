@@ -20,7 +20,7 @@ use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
 use ida_mcp::{
     disasm::generate_disasm_line,
     expand_path, ida,
-    ida::pool::{WorkerPool, WorkerPoolConfig, WorkspaceRegistry},
+    ida::pool::{WorkerPool, WorkerPoolConfig, WorkspaceDatabase, WorkspaceRegistry},
     ida::worker::WorkerBackend,
     FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
 };
@@ -361,7 +361,7 @@ fn main() -> anyhow::Result<()> {
         Command::Serve if workspace.workspace => {
             run_server_workspace(build_filter()?, worker_args, workspace)
         }
-        Command::Serve => run_server(build_filter()?, allow_lumina),
+        Command::Serve => run_server(build_filter()?, worker_args, workspace),
         Command::ServeHttp(args) => {
             run_server_http(args, build_filter()?, worker_args, allow_lumina, workspace)
         }
@@ -454,8 +454,88 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
     }
 }
 
-fn run_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Result<()> {
-    run_server_with_mode(filter, ServerMode::Stdio, allow_lumina)
+/// The default stdio server: the implicit single-database API served by a
+/// router whose IDA runs in one supervised child process.
+///
+/// The child is the same binary in `worker` mode. A call that overruns its
+/// bound kills the child and the next `open_idb` gets a fresh one, which is
+/// what an in-process IDA thread blocked in a native call can never offer.
+/// Idle reaping is off so an open database stays open until `close_idb` or
+/// shutdown, as it always has in this mode.
+fn run_server(
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    info!("Starting IDA MCP Server (stdio transport) with a supervised IDA worker");
+    let exe_path = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+    let pool = WorkerPool::new(WorkerPoolConfig {
+        max_workers: 1,
+        min_workers: 1,
+        worker_idle_timeout: Duration::ZERO,
+        worker_op_timeout: Duration::from_secs(workspace.workspace_worker_op_timeout_secs),
+        exe_path,
+        worker_args,
+    });
+    let database = Arc::new(WorkspaceDatabase::new(pool.clone(), "stdio".to_string()));
+    let backend = WorkerBackend::pooled(database.clone());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+    let result = runtime.block_on(async move {
+        if let Err(error) = pool.warm_min().await {
+            return Err(anyhow::anyhow!(
+                "could not start the IDA worker process ({error}); ida-mcp runs IDA in a \
+                 child process launched from its own executable, so check that the binary \
+                 is executable and, on Windows, sits beside IDA's DLLs"
+            ));
+        }
+        let server = IdaMcpServer::with_filter(backend, ServerMode::Stdio, filter.clone());
+        let task_registry = server.task_registry().clone();
+        let sanitized = SanitizedIdaServer::with_filter(server, filter);
+        let mut service = sanitized
+            .serve(stdio())
+            .await
+            .map_err(|error| anyhow::anyhow!("stdio MCP negotiation failed: {error}"))?;
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = wait_for_shutdown_signal().await {
+                warn!(%error, "Shutdown signal handler failed");
+            }
+            shutdown_signal.cancel();
+        });
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    cancel_background_tasks(&task_registry, "Cancelled by server shutdown");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    if service.is_transport_closed() {
+                        cancel_background_tasks(&task_registry, "Cancelled by client disconnect");
+                        break;
+                    }
+                }
+            }
+        }
+        info!("MCP server shutting down");
+        let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
+        // Close through the child so IDA saves and packs before the pool
+        // stops it; a failure here only means there was nothing to close.
+        let _ = database.close().await;
+        pool.shutdown_all().await;
+        info!("Server stopped");
+        Ok::<_, anyhow::Error>(())
+    });
+    // A signal-driven shutdown can leave the stdin reader blocked on a client
+    // that never closed its end; do not let it pin the process.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 fn run_server_workspace(

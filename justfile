@@ -252,6 +252,10 @@ test-dsc dsc_path="": build
 test-license: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=info just test-license
 
+# Verify a call stuck inside IDA times out, retires the child, and reopens on a fresh one (debug)
+test-stuck-call: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-stuck-call
+
 # Verify a shutdown signal saves the database and exits with stdin still open (debug)
 test-shutdown-signal: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-shutdown-signal

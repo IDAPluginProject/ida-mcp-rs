@@ -473,6 +473,7 @@ impl WorkerPool {
             ToolError::RemoteProtocol(format!("failed to initialize worker {id}: {err}"))
         })?;
         let peer = service.peer().clone();
+        info!(worker_id = id, pid = ?pid, "spawned IDA child worker");
         Ok(Arc::new(ChildSlot {
             id,
             child: Mutex::new(PooledChild {
@@ -876,7 +877,9 @@ impl PooledWorkerHandle {
                 self.pool.mark_dead(&self.slot).await;
                 retire_guard.disarm();
                 Err(ToolError::TimeoutDetailed(format!(
-                    "{tool} exceeded worker operation timeout of {} seconds; killed worker {}",
+                    "{tool} exceeded worker operation timeout of {} seconds; killed worker {}. \
+                     The database it held is no longer open and changes since the last \
+                     save_idb are lost; call open_idb again",
                     timeout.as_secs(),
                     self.worker_id
                 )))

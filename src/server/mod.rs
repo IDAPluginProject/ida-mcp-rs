@@ -1270,6 +1270,10 @@ impl IdaMcpServer {
         }
     }
 
+    /// Foreground bound used inside a child worker: effectively none, because
+    /// the supervising parent enforces the real deadline and retires the child.
+    const WORKER_UNBOUNDED_SECS: u64 = 60 * 60 * 24 * 365;
+
     /// Default page size for xref listings when the caller omits `limit`.
     const DEFAULT_XREFS_LIMIT: usize = 1000;
     /// Hard cap on a single xref page, mirroring other paginated tools.
@@ -1554,9 +1558,15 @@ impl IdaMcpServer {
             }
         });
         let worker_cancel = tokio_util::sync::CancellationToken::new();
-        let timeout = timeout_secs
-            .unwrap_or(default_timeout_secs)
-            .min(MAX_TIMEOUT_SECS);
+        // A child worker cannot interrupt a native IDA call, so its own
+        // timeout would only answer early while its IDA thread stays stuck;
+        // the parent is the watchdog and kills the child at its bound.
+        let timeout = match self.mode {
+            ServerMode::Worker => Self::WORKER_UNBOUNDED_SECS,
+            ServerMode::Stdio | ServerMode::Http => timeout_secs
+                .unwrap_or(default_timeout_secs)
+                .min(MAX_TIMEOUT_SECS),
+        };
         let client_cancel = ctx.ct.clone();
 
         let operation_fut = run(progress_tx, worker_cancel.clone());

@@ -67,8 +67,16 @@ test: fixture
     fi
     echo "🧪 Running stdio integration test..."
     tmp="$(mktemp)"
+    # The payload renames a function and closes (saves); run it on a private
+    # copy of the raw fixture and its database so the shared fixture is never
+    # changed and the test can be rerun.
+    work="$(mktemp -d)"
+    cp "{{ test_bin }}" "$work/mini"
+    cp -R "{{ test_bin }}.dSYM" "$work/mini.dSYM"
+    [ -f "{{ test_i64 }}" ] && cp "{{ test_i64 }}" "$work/mini.i64"
+    sed "s#\"path\":\"fixtures/mini\"#\"path\":\"$work/mini\"#" payloads/mini.jsonl > "$work/mini.jsonl"
     # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
-    (cat payloads/mini.jsonl; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
+    (cat "$work/mini.jsonl"; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
     cat "$tmp"
     # Known expected errors:
     # - patch_asm on ARM (no assembler support)
@@ -601,6 +609,19 @@ measure-tools:
     BIN="{{ server_bin }}" TOP="${TOP:-10}" \
         FAIL_OVER_CHARS="${FAIL_OVER_CHARS:-0}" \
         bash ./measure_tools.sh
+
+# A call stuck inside IDA must time out, retire the child, and reopen on a fresh one (#58)
+test-stuck-call: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    echo "🧪 Running stuck-call test..."
+    MCP_STDIO_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" RUST_LOG="{{ rust_log }}" \
+        bash ./stdio_stuck_call.sh
+    echo "✅ Stuck-call test passed"
 
 # A shutdown signal with stdin still open must save the database and exit (stdio and workspace)
 test-shutdown-signal: test-bootstrap
