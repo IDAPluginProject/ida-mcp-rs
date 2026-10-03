@@ -107,30 +107,37 @@ second_child="$(child_pids "$dir/out.log" | tail -1)"
 send '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"resolve_function","arguments":{"name":"saved_before_hang"}}}'
 wait_response 8 "$dir/out.log" 30 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: the edit saved before the hang is missing" >&2; exit 1; }
 echo "   ✓ reopened on child $second_child with the saved rename intact"
-# A call queued behind a stuck one has started nothing: its own deadline ends
-# only the wait, and must not retire the worker or lose the database.
-send '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import time\ntime.sleep(600)","timeout_secs":15}}}'
+# Calls queued behind a healthy, finite one have started nothing: their
+# own deadline or cancellation ends only the wait, and afterwards the same
+# worker, database, and Python state are still there.
+send '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import time\nqueued_marker = 7\ntime.sleep(25)\nqueued_marker","timeout_secs":60}}}'
 sleep 1
+busy_child="$(child_pids "$dir/out.log" | tail -1)"
 started=$(date +%s)
 send '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":1}}}'
 queued_resp="$(wait_response 61 "$dir/out.log" 40)" || { echo "FAIL: the queued call never returned" >&2; exit 1; }
 elapsed=$(( $(date +%s) - started ))
 echo "$queued_resp" | text | grep -q 'waiting for the IDA worker' || { echo "FAIL: queued call did not report a queue timeout" >&2; echo "$queued_resp" >&2; exit 1; }
 [[ $elapsed -le 20 ]] || { echo "FAIL: queued call took ${elapsed}s" >&2; exit 1; }
-busy_child="$(child_pids "$dir/out.log" | tail -1)"
-kill -0 "$busy_child" 2>/dev/null || { echo "FAIL: a queued call's deadline retired the busy worker $busy_child" >&2; exit 1; }
-echo "   ✓ queued call timed out after ${elapsed}s without touching the busy worker"
-# Cancelling a queued call likewise ends only the wait.
+send '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
+wait_response 63 "$dir/out.log" 10 | text | grep -q '"queued"' || { echo "FAIL: the queued call was not recorded as queued" >&2; exit 1; }
+# Cancelling a queued read and a queued open likewise end only the wait.
 send '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":30}}}'
+send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:66,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
 sleep 1
 send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":65,"reason":"test"}}'
-sleep 3
-kill -0 "$busy_child" 2>/dev/null || { echo "FAIL: cancelling a queued call retired the busy worker $busy_child" >&2; exit 1; }
-echo "   ✓ cancelling a queued call left the busy worker alone"
-# The stuck call itself still ends in retirement.
-wait_response 60 "$dir/out.log" 60 | text | grep -q 'killed worker' || { echo "FAIL: the stuck call behind the queue did not report retirement" >&2; exit 1; }
-send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:62,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
-wait_response 62 "$dir/out.log" 120 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: reopen after the queued case failed" >&2; exit 1; }
+send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":66,"reason":"test"}}'
+# The finite call completes normally despite everything queued behind it.
+finished="$(wait_response 60 "$dir/out.log" 60)" || { echo "FAIL: the finite call behind the queue never returned" >&2; exit 1; }
+echo "$finished" | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: queued deadlines or cancellations broke the running call" >&2; echo "$finished" >&2; exit 1; }
+kill -0 "$busy_child" 2>/dev/null || { echo "FAIL: queued failures retired the healthy worker $busy_child" >&2; exit 1; }
+send '{"jsonrpc":"2.0","id":67,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"queued_marker + 1","timeout_secs":10}}}'
+state_resp="$(wait_response 67 "$dir/out.log" 30)"
+[[ "$(echo "$state_resp" | text | jq -r '.result')" == "8" ]] || { echo "FAIL: Python state did not survive queued failures" >&2; echo "$state_resp" >&2; exit 1; }
+[[ "$(child_pids "$dir/out.log" | tail -1)" == "$busy_child" ]] || { echo "FAIL: a new child was spawned after queued failures" >&2; exit 1; }
+send '{"jsonrpc":"2.0","id":68,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
+wait_response 68 "$dir/out.log" 30 | text | jq -e '.function_count' >/dev/null || { echo "FAIL: the database was unreachable after queued failures" >&2; exit 1; }
+echo "   ✓ queued timeout and cancellations left the worker $busy_child, its database, and its state intact"
 
 # A read tool stuck inside IDA (an output hook that never returns) must be
 # bounded by the supervisor too, and the retirement must be the call's

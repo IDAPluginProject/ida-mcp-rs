@@ -94,6 +94,11 @@ pub enum ToolError {
     #[error("{0}")]
     WorkerRetired(String),
 
+    /// The call's wait for a busy worker ended before the worker took it, so
+    /// nothing ran: the worker, its database, and its state are untouched.
+    #[error("{0}")]
+    NeverDispatched(String),
+
     /// A signal caught inside an IDA SDK call. The worker that reported it
     /// discards its database; a pool parent retires the child.
     #[error("{0}")]
@@ -156,6 +161,7 @@ impl ToolError {
             | ToolError::BackgroundTaskHandlePrivate
             | ToolError::BackgroundTaskRegistryFull { .. }
             | ToolError::PoolExhausted { .. }
+            | ToolError::NeverDispatched(_)
             | ToolError::RemoteProtocol(_)
             | ToolError::IdaError(_)
             | ToolError::DebuggerTeardown(_)
@@ -164,6 +170,15 @@ impl ToolError {
             | ToolError::WorkerClosed
             | ToolError::SdkVersionMismatch(_) => false,
         }
+    }
+
+    /// Whether the call never reached the worker (its wait was cancelled or
+    /// timed out), so no lease, handle, or worker state may be touched.
+    pub fn never_dispatched(&self) -> bool {
+        if let ToolError::NeverDispatched(_) = self {
+            return true;
+        }
+        false
     }
 
     /// Convert to MCP CallToolResult with is_error: true

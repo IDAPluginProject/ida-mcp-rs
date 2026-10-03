@@ -798,7 +798,7 @@ impl PooledWorkerHandle {
             tokio::pin!(lock);
             let admission = async {
                 tokio::time::timeout(timeout, &mut lock).await.map_err(|_| {
-                    ToolError::TimeoutDetailed(format!(
+                    ToolError::NeverDispatched(format!(
                         "{tool} timed out after {} seconds waiting for the IDA worker, which is \
                          still busy with an earlier call; the worker and its database are \
                          unaffected, retry once that call finishes",
@@ -810,7 +810,7 @@ impl PooledWorkerHandle {
                 Some(cancel) => tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        return Err(ToolError::Cancelled(format!(
+                        return Err(ToolError::NeverDispatched(format!(
                             "cancelled {tool} while it was queued behind another call; the \
                              worker and its database are unaffected"
                         )));
@@ -861,8 +861,10 @@ impl PooledWorkerHandle {
                 _ = cancel.cancelled() => {
                     self.pool.mark_dead(&self.slot).await;
                     retire_guard.disarm();
-                    return Err(ToolError::Cancelled(format!(
-                        "cancelled {tool}; killed worker {}",
+                    return Err(ToolError::WorkerRetired(format!(
+                        "cancelled {tool}; killed worker {}. The database it held is no \
+                         longer open and changes since the last save_idb are lost; call \
+                         open_idb again",
                         self.worker_id
                     )));
                 }
@@ -1842,6 +1844,7 @@ impl WorkspaceDatabase {
                     Ok(result)
                 }
             }
+            Err(err) if err.never_dispatched() => Err(err),
             Err(err) => {
                 let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
                 Err(debugger_worker_loss_error(tool, err, debug_pinned))
@@ -3402,6 +3405,9 @@ fn unsettled_open_error_retires_worker(err: &ToolError) -> bool {
 }
 
 fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
+    if err.never_dispatched() {
+        return false;
+    }
     fresh_lease
         || matches!(
             err,
@@ -4019,6 +4025,18 @@ mod tests {
         assert!(!release_error_retires_worker(&ToolError::IdaError(
             "No database is currently open".to_string()
         )));
+    }
+
+    /// A wait that ended before the worker took the call must never release
+    /// the lease the healthy call still holds.
+    #[test]
+    fn never_dispatched_errors_keep_the_lease() {
+        let queued = ToolError::NeverDispatched("cancelled while queued".to_string());
+        assert!(!open_error_releases_lease(false, &queued));
+        assert!(!open_error_releases_lease(true, &queued));
+        assert!(!queued.is_fatal());
+        assert!(queued.never_dispatched());
+        assert!(!release_error_retires_worker(&queued));
     }
 
     #[test]
