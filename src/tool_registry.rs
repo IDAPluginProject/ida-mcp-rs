@@ -424,8 +424,10 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         requirements: ToolRequirements::BASELINE,
         short_desc: "Get database metadata and summary",
         full_desc: "Returns metadata about the currently open database: \
-                    file type, processor architecture, bitness, entry points, \
-                    segment count, function count, and other summary info.",
+                    file type, loader, processor architecture, bitness, function count, \
+                    input path/size/hashes, image_base (the loaded image's base, which \
+                    rebasing updates), base_address (the paragraph base of segmented \
+                    formats; 0 for Mach-O/ELF/PE), min/max/main addresses.",
         example: r#"{}"#,
         default: true,
         keywords: &["info", "metadata", "summary", "database", "binary"],

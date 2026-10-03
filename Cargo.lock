@@ -1165,7 +1165,7 @@ dependencies = [
 [[package]]
 name = "idalib"
 version = "0.7.6+9.5.261001"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#3d6ddbeb3e4a7cca6cea5df062ab083ca9bb574b"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#31f79b4024e8edabd83442d795a6e9d78b72af18"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1179,7 +1179,7 @@ dependencies = [
 [[package]]
 name = "idalib-build"
 version = "0.7.6+9.5.261001"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#3d6ddbeb3e4a7cca6cea5df062ab083ca9bb574b"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#31f79b4024e8edabd83442d795a6e9d78b72af18"
 dependencies = [
  "anyhow",
  "idalib-sys",
@@ -1188,7 +1188,7 @@ dependencies = [
 [[package]]
 name = "idalib-sys"
 version = "0.7.6+9.5.261001"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#3d6ddbeb3e4a7cca6cea5df062ab083ca9bb574b"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#31f79b4024e8edabd83442d795a6e9d78b72af18"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -2201,7 +2201,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

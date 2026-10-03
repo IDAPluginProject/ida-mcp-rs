@@ -17,13 +17,25 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 tmpdir="$(mktemp -d)"
+# Work on a private copy: the script edits, saves, and rebases the database,
+# and a graceful shutdown would persist a half-finished run into the fixture.
+cp "$IDB_PATH" "$tmpdir/$(basename "$IDB_PATH")"
+IDB_PATH="$tmpdir/$(basename "$IDB_PATH")"
 headers_file="$tmpdir/headers.log"
 body_file="$tmpdir/body.log"
 server_log="$tmpdir/server.log"
 
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then
+    # Let the server close and pack its database before its directory goes;
+    # a graceful shutdown is bounded, so reap with a kill if it overruns.
     kill "$server_pid" >/dev/null 2>&1 || true
+    for _ in $(seq 1 20); do
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" 2>/dev/null || true
   fi
   rm -rf "$tmpdir"
 }
@@ -192,6 +204,22 @@ if echo "$plain_resp" | grep -q 'result_is_repr'; then
   echo "$plain_resp" >&2
   exit 1
 fi
+
+# Responses may be SSE-framed; take the JSON payload line.
+tool_text() { sed -n 's/^data: //p; /^{/p' | head -1 | jq -r '.result.content[0].text'; }
+reported_base="$(call_tool 18 idb_meta "{}" | tool_text | jq -r '.image_base')"
+ida_base="$(call_tool 19 run_script "{\"code\":\"import ida_nalt\\nhex(ida_nalt.get_imagebase())\"}" | tool_text | jq -r '.result')"
+[[ -n "$reported_base" && "$reported_base" == "$ida_base" ]] || {
+  echo "idb_meta.image_base ($reported_base) does not match ida_nalt.get_imagebase() ($ida_base)" >&2
+  exit 1
+}
+rebased="$(call_tool 20 run_script "{\"code\":\"import ida_segment, ida_nalt\\nida_segment.rebase_program(0x10000, ida_segment.MSF_FIXONCE)\\nhex(ida_nalt.get_imagebase())\"}" | tool_text | jq -r '.result')"
+after_rebase="$(call_tool 21 idb_meta "{}" | tool_text | jq -r '.image_base')"
+[[ "$rebased" != "$ida_base" && "$after_rebase" == "$rebased" ]] || {
+  echo "idb_meta.image_base did not follow the rebase: before=$ida_base ida=$rebased reported=$after_rebase" >&2
+  exit 1
+}
+call_tool 22 run_script "{\"code\":\"import ida_segment\\nida_segment.rebase_program(-0x10000, ida_segment.MSF_FIXONCE)\"}" >/dev/null
 
 save_resp="$(call_tool 11 save_idb "{}")"
 echo "$save_resp" | grep -q 'saved\\": true' || {
