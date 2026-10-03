@@ -468,7 +468,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Functions,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find the function containing an address",
+        short_desc: "Find the function containing one address",
         full_desc: "Return the function that contains the given address, including start/end and size. \
                     Useful for mapping PC/LR to a function.",
         example: r#"{"address": "0x1000"}"#,
@@ -516,7 +516,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Disassembly,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Disassemble instructions at an address",
+        short_desc: "Disassemble instructions at one or more addresses",
         full_desc: "Disassemble machine code starting at the given address. \
                     Returns assembly instructions with addresses and opcodes. \
                     Specify count to control how many instructions to disassemble.",
@@ -555,7 +555,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Disassembly,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Disassemble the function containing an address",
+        short_desc: "Disassemble the function containing one address",
         full_desc: "Disassemble the function that contains the provided address. \
                     Useful when you only have a PC/LR.",
         example: r#"{"address": "0x1000", "count": 200}"#,
@@ -568,7 +568,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Decompile,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Decompile function to C pseudocode",
+        short_desc: "Decompile one or more functions to C pseudocode",
         full_desc: "Decompile a function using Hex-Rays decompiler (if available). \
                     Returns C-like pseudocode. Accepts address or function name.",
         example: r#"{"address": "0x1000"}"#,
@@ -580,7 +580,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Decompile,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Get pseudocode for specific address/range",
+        short_desc: "Get pseudocode for one or more addresses/ranges",
         full_desc: "Get decompiled pseudocode for a specific address or address range (e.g., a basic block). \
                     Unlike decompile which returns the full function, this returns only statements \
                     corresponding to the given address(es).",
@@ -594,7 +594,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Xrefs,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all references TO an address",
+        short_desc: "Find all references TO one or more addresses",
         full_desc: "Find all cross-references pointing to the given address. \
                     Shows what code/data references this location. \
                     Useful for finding callers, data usage, etc.",
@@ -607,7 +607,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Xrefs,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all references FROM an address",
+        short_desc: "Find all references FROM one or more addresses",
         full_desc: "Find all cross-references originating from the given address. \
                     Shows what this instruction/data references. \
                     Useful for finding callees, data accesses, etc.",
@@ -645,7 +645,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Get basic blocks of a function",
+        short_desc: "Get basic blocks of one or more functions",
         full_desc: "Get the control flow graph basic blocks for a function. \
                     Returns block addresses, sizes, and successor relationships.",
         example: r#"{"address": "0x1000"}"#,
@@ -657,7 +657,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all callers of a function",
+        short_desc: "Find all callers of one or more functions",
         full_desc: "Find all functions that call the specified function. \
                     Returns caller addresses and names.",
         example: r#"{"address": "0x1000"}"#,
@@ -669,7 +669,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Find all functions called by a function",
+        short_desc: "Find all functions called by one or more functions",
         full_desc: "Find all functions that are called by the specified function. \
                     Returns callee addresses and names.",
         example: r#"{"address": "0x1000"}"#,
@@ -681,7 +681,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::ControlFlow,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Build call graph from a function",
+        short_desc: "Build call graph from one or more root functions",
         full_desc: "Build a call graph starting from a function. Direction is callees by default \
                     for compatibility, or callers/both when explicitly requested. Returns nodes \
                     and normalized caller-to-callee edges. The truncated flag is true when \
@@ -708,7 +708,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read raw bytes from an address",
+        short_desc: "Read raw bytes from one or more addresses",
         full_desc: "Read raw bytes from the database at the specified address. \
                     Returns bytes as hex string. Useful for examining data. \
                     You can also supply a symbol/function name with an optional offset.",
@@ -721,7 +721,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read string at an address",
+        short_desc: "Read strings at one or more addresses",
         full_desc: "Read a null-terminated string at the specified address. \
                     Supports C strings and other string types recognized by IDA.",
         example: r#"{"address": "0x1000"}"#,
@@ -733,7 +733,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Memory,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read unsigned integers of a given byte width",
+        short_desc: "Read unsigned integers of a given byte width at one or more addresses",
         full_desc: "Read an unsigned integer at each address. size is the width in bytes \
                     (1, 2, 4, or 8) and the value is read in the database's byte order.",
         example: r#"{"address": "0x1000", "size": 4}"#,
@@ -855,7 +855,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Metadata,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Resolve address to segment/function/symbol",
+        short_desc: "Resolve one address to segment/function/symbol",
         full_desc: "Return address context including segment info, containing function, \
                     and nearest named symbol.",
         example: r#"{"address": "0x1000"}"#,
@@ -995,7 +995,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Types,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Infer/guess type at an address",
+        short_desc: "Infer/guess type at one address",
         full_desc: "Guess a type for an address or symbol using IDA's heuristics.",
         example: r#"{"name": "interesting_function"}"#,
         default: false,
@@ -1006,7 +1006,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Types,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Get stack frame info",
+        short_desc: "Get stack frame info for one function",
         full_desc: "Get stack frame layout for the function at an address, including \
                     args/locals ranges and per-member type info.",
         example: r#"{"address": "0x1000"}"#,
@@ -1063,7 +1063,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Types,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Read a struct instance at an address",
+        short_desc: "Read struct instances at one or more addresses",
         full_desc: "Read raw bytes for each struct member at a given address.",
         example: r#"{"address": "0x1000", "name": "MyStruct"}"#,
         default: false,

@@ -1234,14 +1234,6 @@ impl IdaMcpServer {
         strings.iter().map(|s| Self::parse_address(s)).collect()
     }
 
-    fn value_to_single_address(value: &Value) -> Result<u64, ToolError> {
-        let addrs = Self::value_to_addresses(value)?;
-        addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| ToolError::InvalidAddress("empty address list".to_string()))
-    }
-
     /// The address selector of a mutating tool, after checking the caller
     /// named exactly one target: one address or one non-empty name.
     fn mutation_target_address(
@@ -1264,12 +1256,16 @@ impl IdaMcpServer {
         }
     }
 
+    /// For tools that return one result: a scalar or a one-element array is
+    /// accepted, anything else is refused rather than silently truncated.
     fn value_to_exactly_one_address(value: &Value, field_name: &str) -> Result<u64, ToolError> {
         let addresses = Self::value_to_addresses(value)?;
         match addresses.as_slice() {
             [address] => Ok(*address),
-            _ => Err(ToolError::InvalidParams(format!(
-                "{field_name} must contain exactly one value"
+            many => Err(ToolError::InvalidParams(format!(
+                "{field_name} must contain exactly one address, got {}; this tool handles one \
+                 address per call",
+                many.len()
             ))),
         }
     }
@@ -4108,13 +4104,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get address context (segment, function, nearest symbol)")]
+    #[tool(description = "Get address context (segment, function, nearest symbol) for one address")]
     async fn addr_info(
         &self,
         Parameters(req): Parameters<AddrInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -4133,13 +4129,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get the function that contains an address")]
+    #[tool(description = "Get the function that contains one address (one address per call)")]
     async fn function_at(
         &self,
         Parameters(req): Parameters<FunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -4156,7 +4152,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get disassembly at an address")]
+    #[tool(
+        description = "Get disassembly at one or more addresses (address accepts an array; one result per address)"
+    )]
     #[instrument(skip_all, fields(address = %req.address, count = req.count))]
     async fn disasm(
         &self,
@@ -4206,11 +4204,11 @@ impl IdaMcpServer {
         Parameters(req): Parameters<RenderRangeRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: render_range");
-        let start = match Self::value_to_single_address(&req.start) {
+        let start = match Self::value_to_exactly_one_address(&req.start, "start") {
             Ok(address) => address,
             Err(error) => return Ok(error.to_tool_result()),
         };
-        let end = match Self::value_to_single_address(&req.end) {
+        let end = match Self::value_to_exactly_one_address(&req.end, "end") {
             Ok(address) => address,
             Err(error) => return Ok(error.to_tool_result()),
         };
@@ -4243,13 +4241,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Disassemble the function containing an address")]
+    #[tool(description = "Disassemble the function containing one address (one address per call)")]
     async fn disasm_function_at(
         &self,
         Parameters(req): Parameters<DisasmFunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -4269,7 +4267,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Decompile a function using Hex-Rays (if available)")]
+    #[tool(
+        description = "Decompile one or more functions with Hex-Rays (address accepts an array; one result per function)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn decompile(
         &self,
@@ -4309,7 +4309,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get decompiled pseudocode at a specific address or address range. \
+        description = "Get decompiled pseudocode at one or more addresses or address ranges. \
         Unlike 'decompile' which returns the full function, this returns only the statements \
         that correspond to the given address(es). Useful for getting pseudocode for a basic block \
         or specific instruction. If end_address is provided, returns statements covering the range."
@@ -4479,7 +4479,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get cross-references TO an address (who references this address). \
+        description = "Get cross-references TO one or more addresses (address accepts an array). \
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through high-frequency targets."
     )]
@@ -4493,7 +4493,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get cross-references FROM an address (what this address references). \
+        description = "Get cross-references FROM one or more addresses (address accepts an array). \
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through the remaining references."
     )]
@@ -4560,7 +4560,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Read raw bytes from an address as hex string")]
+    #[tool(
+        description = "Read raw bytes at one or more addresses as hex strings (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(size = req.size))]
     async fn get_bytes(
         &self,
@@ -4630,14 +4632,14 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_patches");
         let start = match req.start.as_ref() {
-            Some(value) => match Self::value_to_single_address(value) {
+            Some(value) => match Self::value_to_exactly_one_address(value, "address") {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(error.to_tool_result()),
             },
             None => None,
         };
         let end = match req.end.as_ref() {
-            Some(value) => match Self::value_to_single_address(value) {
+            Some(value) => match Self::value_to_exactly_one_address(value, "address") {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(error.to_tool_result()),
             },
@@ -4657,7 +4659,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get basic blocks of a function (control flow graph nodes)")]
+    #[tool(description = "Get basic blocks of one or more functions (address accepts an array)")]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn basic_blocks(
         &self,
@@ -4699,7 +4701,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get functions called BY a function (callees/children in call graph)")]
+    #[tool(
+        description = "Get functions called BY one or more functions (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn callees(
         &self,
@@ -4741,7 +4745,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get functions that CALL a function (callers/parents in call graph)")]
+    #[tool(
+        description = "Get functions that CALL one or more functions (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn callers(
         &self,
@@ -5168,11 +5174,11 @@ impl IdaMcpServer {
         Parameters(req): Parameters<FindPathsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: find_paths");
-        let start = match Self::value_to_single_address(&req.start) {
+        let start = match Self::value_to_exactly_one_address(&req.start, "start") {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
-        let end = match Self::value_to_single_address(&req.end) {
+        let end = match Self::value_to_exactly_one_address(&req.end, "end") {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -5195,7 +5201,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Build a callgraph rooted at an address")]
+    #[tool(
+        description = "Build a callgraph rooted at one or more addresses (roots accepts an array)"
+    )]
     #[instrument(skip_all)]
     async fn callgraph(
         &self,
@@ -5390,7 +5398,7 @@ impl IdaMcpServer {
         let addr = try_param!(req
             .address
             .as_ref()
-            .map(Self::value_to_single_address)
+            .map(|value| Self::value_to_exactly_one_address(value, "address"))
             .transpose());
         match self
             .worker
@@ -5512,12 +5520,14 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get stack frame info")]
+    #[tool(
+        description = "Get stack frame info for the function at one address (one address per call)"
+    )]
     async fn stack_frame(
         &self,
         Parameters(req): Parameters<AddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match Self::value_to_single_address(&req.address) {
+        let addr = match Self::value_to_exactly_one_address(&req.address, "address") {
             Ok(addr) => addr,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -5637,7 +5647,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Read values of a struct instance at an address")]
+    #[tool(
+        description = "Read values of a struct instance at one or more addresses (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address, ordinal = req.ordinal, name = ?req.name))]
     async fn read_struct(
         &self,
@@ -5810,13 +5822,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Infer/guess type at an address")]
+    #[tool(description = "Infer/guess type at one address (one address per call)")]
     async fn infer_types(
         &self,
         Parameters(req): Parameters<InferTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -7739,6 +7751,109 @@ mod tests {
         )
     }
 
+    /// One-result tools refuse several addresses instead of answering for the
+    /// first and dropping the rest; a one-element array still works.
+    #[tokio::test]
+    async fn one_result_tools_refuse_multiple_addresses() {
+        let server = test_server();
+        let two = json!(["0x1000", "0x2000"]);
+
+        let function_at = server
+            .function_at(Parameters(crate::server::FunctionAtRequest {
+                address: Some(two.clone()),
+                target_name: None,
+                offset: None,
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(function_at.is_error, Some(true));
+        let text = first_text(&function_at);
+        assert!(
+            text.contains("exactly one address") && text.contains("got 2"),
+            "{text}"
+        );
+
+        let addr_info = server
+            .addr_info(Parameters(crate::server::AddrInfoRequest {
+                address: Some(two),
+                target_name: None,
+                offset: None,
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(addr_info.is_error, Some(true));
+        assert!(first_text(&addr_info).contains("got 2"));
+
+        // A one-element array is the scalar; it reaches the worker (which this
+        // test server never answers), so the result is not a parameter error.
+        let one = json!(["0x1000"]);
+        let outcome = IdaMcpServer::value_to_exactly_one_address(&one, "address");
+        assert_eq!(outcome.ok(), Some(0x1000));
+        let empty = IdaMcpServer::value_to_exactly_one_address(&json!([]), "address");
+        assert!(empty
+            .unwrap_err()
+            .to_string()
+            .contains("no addresses provided"));
+    }
+
+    /// What the agent reads must say which address parameters take arrays.
+    #[test]
+    fn address_descriptions_state_batch_or_single() {
+        let batch = [
+            "disasm",
+            "decompile",
+            "pseudocode_at",
+            "get_bytes",
+            "basic_blocks",
+            "callees",
+            "callers",
+            "callgraph",
+            "read_struct",
+            "read_int",
+            "get_string",
+            "xrefs_to",
+            "xrefs_from",
+        ];
+        let single = [
+            "addr_info",
+            "function_at",
+            "disasm_function_at",
+            "stack_frame",
+            "infer_types",
+        ];
+        let server = crate::server::SanitizedIdaServer::new(test_server());
+        for name in batch {
+            let tool = server.get_tool(name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("one or more") || description.contains("(es)"),
+                "{name} tools/list description hides its batch support: {description}"
+            );
+            let short = crate::tool_registry::get_tool(name).expect(name).short_desc;
+            assert!(
+                short.contains("one or more")
+                    || short.contains("(es)")
+                    || short.contains("addresses"),
+                "{name} catalog description hides its batch support: {short}"
+            );
+        }
+        for name in single {
+            let tool = server.get_tool(name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("one address"),
+                "{name} tools/list description does not say it takes one address: {description}"
+            );
+            assert!(
+                crate::tool_registry::get_tool(name)
+                    .expect(name)
+                    .short_desc
+                    .contains("one "),
+                "{name} catalog description does not say it takes one address"
+            );
+        }
+    }
+
     /// Addresses parse with digit separators; a symbol in an address slot is
     /// named as such, with the original spelling, and pointed at the fix.
     #[test]
@@ -9072,7 +9187,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "58e00b524a9c87b10c497ddda07554b9f783a41f3218d3ca5fa4a679c6d09705"
+            "24dd77639e1bd2ec026d4293a44553ec153afaf9dbb1ee780aff27567e5abb3c"
         );
     }
 
@@ -9835,7 +9950,7 @@ mod tests {
         assert!(rejected(None, Some("")).contains("must not be empty"));
         for several in [json!(["0x10", "0x20"]), json!("0x10, 0x20")] {
             assert!(
-                rejected(Some(several), None).contains("exactly one value"),
+                rejected(Some(several), None).contains("exactly one address"),
                 "multi-address input must not be truncated to its first entry"
             );
         }

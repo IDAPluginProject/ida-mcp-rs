@@ -507,7 +507,7 @@ pub struct StructInfoRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadStructRequest {
-    #[schemars(description = "Address of struct instance (string/number)")]
+    #[schemars(description = "Address(es) of struct instances (string/number or array)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Value,
     #[schemars(description = "Struct ordinal (numeric)")]
