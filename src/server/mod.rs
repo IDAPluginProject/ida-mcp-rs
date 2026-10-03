@@ -927,6 +927,10 @@ async fn extract_universal_slice(
 /// How long the parent's own foreground timer waits beyond the pool's kill
 /// point before giving up on the typed retirement error.
 const FOREGROUND_SUPERVISOR_MARGIN_SECS: u64 = 3;
+/// Largest foreground deadline: the largest request plus the pool's grace and
+/// the supervisor margin, so a maximum request still ends with the typed error.
+const FOREGROUND_MAX_SECS: u64 =
+    MAX_TIMEOUT_SECS + CHILD_TIMEOUT_GRACE_SECS + FOREGROUND_SUPERVISOR_MARGIN_SECS;
 
 fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64) -> u64 {
     timeout_secs
@@ -1580,11 +1584,14 @@ impl IdaMcpServer {
         // A child worker cannot interrupt a native IDA call, so its own
         // timeout would only answer early while its IDA thread stays stuck;
         // the parent is the watchdog and kills the child at its bound.
+        // A router's deadline includes the pool's grace and a margin above
+        // MAX_TIMEOUT_SECS (see foreground_timeout_secs); clamping it back
+        // would let this timer beat the supervisor at the maximum request.
         let timeout = match self.mode {
             ServerMode::Worker => Self::WORKER_UNBOUNDED_SECS,
             ServerMode::Stdio | ServerMode::Http => timeout_secs
                 .unwrap_or(default_timeout_secs)
-                .min(MAX_TIMEOUT_SECS),
+                .min(FOREGROUND_MAX_SECS),
         };
         let client_cancel = ctx.ct.clone();
 

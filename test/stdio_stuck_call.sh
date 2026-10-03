@@ -107,6 +107,31 @@ second_child="$(child_pids "$dir/out.log" | tail -1)"
 send '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"resolve_function","arguments":{"name":"saved_before_hang"}}}'
 wait_response 8 "$dir/out.log" 30 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: the edit saved before the hang is missing" >&2; exit 1; }
 echo "   ✓ reopened on child $second_child with the saved rename intact"
+# A call queued behind a stuck one has started nothing: its own deadline ends
+# only the wait, and must not retire the worker or lose the database.
+send '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import time\ntime.sleep(600)","timeout_secs":15}}}'
+sleep 1
+started=$(date +%s)
+send '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":1}}}'
+queued_resp="$(wait_response 61 "$dir/out.log" 40)" || { echo "FAIL: the queued call never returned" >&2; exit 1; }
+elapsed=$(( $(date +%s) - started ))
+echo "$queued_resp" | text | grep -q 'waiting for the IDA worker' || { echo "FAIL: queued call did not report a queue timeout" >&2; echo "$queued_resp" >&2; exit 1; }
+[[ $elapsed -le 20 ]] || { echo "FAIL: queued call took ${elapsed}s" >&2; exit 1; }
+busy_child="$(child_pids "$dir/out.log" | tail -1)"
+kill -0 "$busy_child" 2>/dev/null || { echo "FAIL: a queued call's deadline retired the busy worker $busy_child" >&2; exit 1; }
+echo "   ✓ queued call timed out after ${elapsed}s without touching the busy worker"
+# Cancelling a queued call likewise ends only the wait.
+send '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":30}}}'
+sleep 1
+send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":65,"reason":"test"}}'
+sleep 3
+kill -0 "$busy_child" 2>/dev/null || { echo "FAIL: cancelling a queued call retired the busy worker $busy_child" >&2; exit 1; }
+echo "   ✓ cancelling a queued call left the busy worker alone"
+# The stuck call itself still ends in retirement.
+wait_response 60 "$dir/out.log" 60 | text | grep -q 'killed worker' || { echo "FAIL: the stuck call behind the queue did not report retirement" >&2; exit 1; }
+send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:62,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
+wait_response 62 "$dir/out.log" 120 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: reopen after the queued case failed" >&2; exit 1; }
+
 # A read tool stuck inside IDA (an output hook that never returns) must be
 # bounded by the supervisor too, and the retirement must be the call's
 # top-level error even though search normally folds per-item failures.
@@ -126,6 +151,18 @@ echo "   ✓ stuck read tool returned the retirement error after ${elapsed}s and
 send '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":5}}}'
 wait_response 12 "$dir/out.log" 30 | text | grep -q 'No database is currently open' || { echo "FAIL: a later read tool did not report the database as closed" >&2; exit 1; }
 echo "   ✓ later calls answer immediately with no database open"
+
+# A worker that dies mid-call is a fatal, top-level error even from a batch
+# tool, never a successful envelope with the loss buried in results[].
+send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:70,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
+wait_response 70 "$dir/out.log" 120 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: reopen before the crash case failed" >&2; exit 1; }
+send '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import ida_idp, os\nclass Die(ida_idp.IDP_Hooks):\n    def ev_out_insn(self, ctx):\n        os._exit(3)\ndie_hook = Die()\ndie_hook.hook()"}}}'
+wait_response 71 "$dir/out.log" 30 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: could not install the exiting output hook" >&2; exit 1; }
+send '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"search","arguments":{"targets":["ret"],"kind":"text","limit":5,"timeout_secs":10}}}'
+dead_resp="$(wait_response 72 "$dir/out.log" 40)" || { echo "FAIL: search on a dying worker never returned" >&2; exit 1; }
+echo "$dead_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: a worker dying inside search returned success" >&2; echo "$dead_resp" >&2; exit 1; }
+echo "$dead_resp" | text | grep -q 'crashed or disconnected' || { echo "FAIL: worker loss inside search was not reported as such" >&2; echo "$dead_resp" >&2; exit 1; }
+echo "   ✓ worker death inside a batch tool is the call's error"
 exec 3>&-
 wait "$pid" 2>/dev/null || true
 pid=

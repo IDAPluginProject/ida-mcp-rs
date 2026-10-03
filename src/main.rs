@@ -467,6 +467,12 @@ fn run_server(
     worker_args: Vec<OsString>,
     workspace: WorkspaceArgs,
 ) -> anyhow::Result<()> {
+    if workspace.workspace_worker_op_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--workspace-worker-op-timeout-secs must be at least 1; it is the watchdog for \
+             the supervised IDA worker"
+        ));
+    }
     info!("Starting IDA MCP Server (stdio transport) with a supervised IDA worker");
     let exe_path = std::env::current_exe()
         .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;

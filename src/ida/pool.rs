@@ -786,8 +786,44 @@ impl PooledWorkerHandle {
         timeout: Duration,
         cancel: Option<CancellationToken>,
         mut open_dispatch: Option<OpenDispatch>,
+        dispatch_progress: Option<DispatchProgress>,
     ) -> Result<CallToolResult, ToolError> {
-        let _call_guard = self.slot.call_lock.lock().await;
+        // Admission: a call waiting behind another one has started nothing,
+        // so its cancellation or deadline ends only the wait. The worker and
+        // its database are untouched; retirement applies only to a call that
+        // actually ran.
+        let admitted = Instant::now();
+        let _call_guard = {
+            let lock = self.slot.call_lock.lock();
+            tokio::pin!(lock);
+            let admission = async {
+                tokio::time::timeout(timeout, &mut lock).await.map_err(|_| {
+                    ToolError::TimeoutDetailed(format!(
+                        "{tool} timed out after {} seconds waiting for the IDA worker, which is \
+                         still busy with an earlier call; the worker and its database are \
+                         unaffected, retry once that call finishes",
+                        timeout.as_secs()
+                    ))
+                })
+            };
+            match cancel.as_ref() {
+                Some(cancel) => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(ToolError::Cancelled(format!(
+                            "cancelled {tool} while it was queued behind another call; the \
+                             worker and its database are unaffected"
+                        )));
+                    }
+                    guard = admission => guard?,
+                },
+                None => admission.await?,
+            }
+        };
+        if let Some(progress) = dispatch_progress {
+            progress.dispatched();
+        }
+        let timeout = timeout.saturating_sub(admitted.elapsed());
         let tracks_open = open_dispatch.is_some();
         let mut previous_idb_path = None;
         let peer = {
@@ -1028,6 +1064,35 @@ struct PooledDatabaseLease {
     /// which re-checks the dispatching (worker, generation) pair under this
     /// same mutex.
     debug_pinned: bool,
+}
+
+/// Phases a router can report truthfully for a foreground call it relays:
+/// `queued` while the call waits for the worker, then the tool's own phase
+/// once the worker has it. The child's finer phases do not cross the transport.
+pub(crate) struct DispatchProgress {
+    tx: ProgressSender,
+    phase: &'static str,
+    message: &'static str,
+}
+
+impl DispatchProgress {
+    pub(crate) fn new(tx: ProgressSender, phase: &'static str, message: &'static str) -> Self {
+        Self { tx, phase, message }
+    }
+
+    fn queued(&self) {
+        emit_progress(
+            Some(&self.tx),
+            "queued",
+            0.0,
+            Some(1.0),
+            "Waiting for the IDA worker to take this call",
+        );
+    }
+
+    fn dispatched(&self) {
+        emit_progress(Some(&self.tx), self.phase, 0.1, Some(1.0), self.message);
+    }
 }
 
 /// A child-tool outcome plus the lease that served it, kept even for failed
@@ -1722,6 +1787,19 @@ impl WorkspaceDatabase {
         cancel: Option<CancellationToken>,
         expected_generation: Option<DatabaseGeneration>,
     ) -> DispatchedCall {
+        self.dispatch_result_observed(tool, args, timeout_secs, cancel, expected_generation, None)
+            .await
+    }
+
+    async fn dispatch_result_observed(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+        dispatch_progress: Option<DispatchProgress>,
+    ) -> DispatchedCall {
         let (handle, generation) = match self
             .required_handle_for_generation(expected_generation)
             .await
@@ -1745,7 +1823,10 @@ impl WorkspaceDatabase {
             }
         };
         let timeout = self.pool.worker_op_timeout(timeout_secs);
-        let result = match handle.call_tool(tool, args, timeout, cancel, None).await {
+        let result = match handle
+            .call_tool(tool, args, timeout, cancel, None, dispatch_progress)
+            .await
+        {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
                     if child_tool_error_retires_worker(tool, &err) {
@@ -1803,6 +1884,26 @@ impl WorkspaceDatabase {
     ) -> Result<Value, ToolError> {
         self.call_value_for_generation(tool, args, timeout_secs, cancel, None)
             .await
+    }
+
+    /// `call_value` for a foreground tool whose phases the router reports:
+    /// `queued` now, and `progress.phase` once the child has the call.
+    async fn call_value_observed(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        progress: Option<DispatchProgress>,
+    ) -> Result<Value, ToolError> {
+        if let Some(progress) = progress.as_ref() {
+            progress.queued();
+        }
+        let result = self
+            .dispatch_result_observed(tool, args, timeout_secs, cancel, None, progress)
+            .await
+            .result?;
+        remote::parse_value(result, tool)
     }
 
     async fn call_value_for_generation(
@@ -1878,7 +1979,7 @@ impl WorkspaceDatabase {
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<DbInfo, ToolError> {
         self.open_observed_with_generation(
@@ -1893,7 +1994,7 @@ impl WorkspaceDatabase {
             extra_args,
             idb_out,
             timeout_secs,
-            _progress_tx,
+            progress_tx,
             cancel,
         )
         .await
@@ -1914,9 +2015,15 @@ impl WorkspaceDatabase {
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<OpenedDatabase, ToolError> {
+        let dispatch_progress = progress_tx.map(|tx| {
+            DispatchProgress::new(tx, "opening", "Opening the database in the IDA worker")
+        });
+        if let Some(progress) = dispatch_progress.as_ref() {
+            progress.queued();
+        }
         let (handle, generation, fresh_lease) = self.lease_for_open().await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
         let open_dispatch = OpenDispatch::for_request(path, idb_out.as_deref(), rebuild);
@@ -1939,6 +2046,7 @@ impl WorkspaceDatabase {
                 timeout,
                 cancel,
                 Some(open_dispatch),
+                dispatch_progress,
             )
             .await;
 
@@ -2828,18 +2936,19 @@ impl WorkspaceDatabase {
         cancel: Option<CancellationToken>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
-        emit_progress(
-            progress_tx.as_ref(),
-            "analyzing",
-            0.0,
-            Some(1.0),
-            "Waiting for IDA auto-analysis in the IDA worker",
-        );
-        self.call_value(
+        let progress = progress_tx.map(|tx| {
+            DispatchProgress::new(
+                tx,
+                "analyzing",
+                "Waiting for IDA auto-analysis in the IDA worker",
+            )
+        });
+        self.call_value_observed(
             "analyze_funcs",
             analyze_funcs_child_args(timeout_secs, false),
             timeout_secs,
             cancel,
+            progress,
         )
         .await
     }
@@ -3047,20 +3156,21 @@ impl WorkspaceDatabase {
         cancel: Option<CancellationToken>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
-        // The child's phases do not cross the transport; report the one the
-        // parent knows, so recent_operations shows a running script.
-        emit_progress(
-            progress_tx.as_ref(),
-            "executing",
-            0.0,
-            Some(1.0),
-            "Executing IDAPython script in the IDA worker",
-        );
-        self.call_value(
+        // The child's phases do not cross the transport; the router reports
+        // what it knows: queued until the worker takes the call, then executing.
+        let progress = progress_tx.map(|tx| {
+            DispatchProgress::new(
+                tx,
+                "executing",
+                "Executing IDAPython script in the IDA worker",
+            )
+        });
+        self.call_value_observed(
             "run_script",
             run_script_child_args(code, timeout_secs),
             timeout_secs,
             cancel,
+            progress,
         )
         .await
     }

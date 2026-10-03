@@ -133,7 +133,8 @@ impl ToolError {
         match self {
             ToolError::SdkCrashed(_)
             | ToolError::DebuggerSessionLost(_)
-            | ToolError::WorkerRetired(_) => true,
+            | ToolError::WorkerRetired(_)
+            | ToolError::WorkerCrashed { .. } => true,
             ToolError::NoDatabaseOpen
             | ToolError::DatabaseAlreadyOpen(_)
             | ToolError::OpenFailed(_)
@@ -155,7 +156,6 @@ impl ToolError {
             | ToolError::BackgroundTaskHandlePrivate
             | ToolError::BackgroundTaskRegistryFull { .. }
             | ToolError::PoolExhausted { .. }
-            | ToolError::WorkerCrashed { .. }
             | ToolError::RemoteProtocol(_)
             | ToolError::IdaError(_)
             | ToolError::DebuggerTeardown(_)
