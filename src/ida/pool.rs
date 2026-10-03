@@ -4,7 +4,7 @@ use crate::error::ToolError;
 use crate::ida::handlers::database::{database_path_for_open_request, RawOpenArtifactCleanup};
 use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
 use crate::ida::lock::remove_mcp_lock_for_pid;
-use crate::ida::observability::ProgressSender;
+use crate::ida::observability::{emit_progress, ProgressSender};
 use crate::ida::remote;
 use crate::ida::types::*;
 use crate::ida::worker::{
@@ -876,7 +876,7 @@ impl PooledWorkerHandle {
             Err(_) => {
                 self.pool.mark_dead(&self.slot).await;
                 retire_guard.disarm();
-                Err(ToolError::TimeoutDetailed(format!(
+                Err(ToolError::WorkerRetired(format!(
                     "{tool} exceeded worker operation timeout of {} seconds; killed worker {}. \
                      The database it held is no longer open and changes since the last \
                      save_idb are lost; call open_idb again",
@@ -1095,7 +1095,7 @@ fn debugger_worker_loss_error(tool: &str, error: ToolError, debug_pinned: bool) 
     let uncertain_start = matches!(tool, "debug_launch" | "debug_attach")
         && matches!(
             &error,
-            ToolError::Timeout(_) | ToolError::TimeoutDetailed(_)
+            ToolError::Timeout(_) | ToolError::TimeoutDetailed(_) | ToolError::WorkerRetired(_)
         );
     if !debug_pinned && !uncertain_start {
         return error;
@@ -2824,10 +2824,17 @@ impl WorkspaceDatabase {
 
     pub async fn analyze_funcs_observed(
         &self,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
+        emit_progress(
+            progress_tx.as_ref(),
+            "analyzing",
+            0.0,
+            Some(1.0),
+            "Waiting for IDA auto-analysis in the IDA worker",
+        );
         self.call_value(
             "analyze_funcs",
             analyze_funcs_child_args(timeout_secs, false),
@@ -3036,10 +3043,19 @@ impl WorkspaceDatabase {
     pub async fn run_script_observed(
         &self,
         code: &str,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
+        // The child's phases do not cross the transport; report the one the
+        // parent knows, so recent_operations shows a running script.
+        emit_progress(
+            progress_tx.as_ref(),
+            "executing",
+            0.0,
+            Some(1.0),
+            "Executing IDAPython script in the IDA worker",
+        );
         self.call_value(
             "run_script",
             run_script_child_args(code, timeout_secs),
@@ -3239,6 +3255,7 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
             | ToolError::DebuggerTeardown(_)
             | ToolError::WorkerCrashed { .. }
             | ToolError::SdkCrashed(_)
+            | ToolError::WorkerRetired(_)
             | ToolError::RemoteProtocol(_)
             | ToolError::WorkerClosed
     )
@@ -3250,6 +3267,7 @@ fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
         ToolError::WorkerClosed
             | ToolError::WorkerCrashed { .. }
             | ToolError::SdkCrashed(_)
+            | ToolError::WorkerRetired(_)
             | ToolError::RemoteProtocol(_)
     ) {
         return true;
@@ -3268,6 +3286,7 @@ fn unsettled_open_error_retires_worker(err: &ToolError) -> bool {
             | ToolError::TimeoutDetailed(_)
             | ToolError::Cancelled(_)
             | ToolError::SdkCrashed(_)
+            | ToolError::WorkerRetired(_)
             | ToolError::WorkerClosed
     )
 }
@@ -3281,6 +3300,7 @@ fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
                 | ToolError::Cancelled(_)
                 | ToolError::WorkerCrashed { .. }
                 | ToolError::SdkCrashed(_)
+                | ToolError::WorkerRetired(_)
                 | ToolError::WorkerClosed
         )
 }

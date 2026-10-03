@@ -72,7 +72,7 @@ test: fixture
     # changed and the test can be rerun.
     work="$(mktemp -d)"
     cp "{{ test_bin }}" "$work/mini"
-    cp -R "{{ test_bin }}.dSYM" "$work/mini.dSYM"
+    [ -d "{{ test_bin }}.dSYM" ] && cp -R "{{ test_bin }}.dSYM" "$work/mini.dSYM"
     [ -f "{{ test_i64 }}" ] && cp "{{ test_i64 }}" "$work/mini.i64"
     sed "s#\"path\":\"fixtures/mini\"#\"path\":\"$work/mini\"#" payloads/mini.jsonl > "$work/mini.jsonl"
     # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)

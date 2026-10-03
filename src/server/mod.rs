@@ -924,6 +924,10 @@ async fn extract_universal_slice(
     Ok(dest)
 }
 
+/// How long the parent's own foreground timer waits beyond the pool's kill
+/// point before giving up on the typed retirement error.
+const FOREGROUND_SUPERVISOR_MARGIN_SECS: u64 = 3;
+
 fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64) -> u64 {
     timeout_secs
         .unwrap_or(default_timeout_secs)
@@ -1470,10 +1474,15 @@ impl IdaMcpServer {
         next_operation_id(self.operation_nonce.as_ref())
     }
 
+    /// Let a timed-out or cancelled operation settle briefly. If it settles
+    /// with a fatal error (the supervisor retired the worker), that error is
+    /// returned so the client learns the database is gone, instead of the
+    /// generic timeout that would hide it.
     async fn finish_cancelled_foreground<T, Fut>(
         tool_name: &'static str,
         operation_fut: Pin<&mut Fut>,
-    ) where
+    ) -> Option<ToolError>
+    where
         Fut: std::future::Future<Output = Result<T, ToolError>>,
     {
         let cleanup = tokio::time::timeout(
@@ -1481,12 +1490,17 @@ impl IdaMcpServer {
             operation_fut,
         )
         .await;
-        if cleanup.is_err() {
-            warn!(
-                tool_name,
-                timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
-                "foreground operation did not finish cancellation cleanup before response"
-            );
+        match cleanup {
+            Ok(Err(error)) if error.is_fatal() => Some(error),
+            Ok(_) => None,
+            Err(_) => {
+                warn!(
+                    tool_name,
+                    timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
+                    "foreground operation did not finish cancellation cleanup before response"
+                );
+                None
+            }
         }
     }
 
@@ -1496,7 +1510,12 @@ impl IdaMcpServer {
         default_timeout_secs: u64,
     ) -> Option<u64> {
         if self.worker.is_pooled() {
-            return Some(timeout_with_child_grace(timeout_secs, default_timeout_secs));
+            // Past the pool's kill point, so the supervisor's typed
+            // retirement error is what the client gets, not a generic timeout.
+            return Some(
+                timeout_with_child_grace(timeout_secs, default_timeout_secs)
+                    .saturating_add(FOREGROUND_SUPERVISOR_MARGIN_SECS),
+            );
         }
         timeout_secs
     }
@@ -1624,9 +1643,16 @@ impl IdaMcpServer {
                 }
             }
             Outcome::TimedOut(timeout_secs) => {
-                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
+                let fatal =
+                    Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
+                if let Some(error) = fatal {
+                    let _ = self
+                        .operation_registry
+                        .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                    return Err(ForegroundOperationError::Tool(error));
+                }
                 let snapshot = self
                     .operation_registry
                     .finish_timed_out(
@@ -1649,9 +1675,16 @@ impl IdaMcpServer {
                 })
             }
             Outcome::Cancelled => {
-                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
+                let fatal =
+                    Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
+                if let Some(error) = fatal {
+                    let _ = self
+                        .operation_registry
+                        .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                    return Err(ForegroundOperationError::Tool(error));
+                }
                 let snapshot = self
                     .operation_registry
                     .finish_cancelled(&op_id, format!("{tool_name} cancelled by client"))

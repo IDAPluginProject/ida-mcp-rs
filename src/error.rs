@@ -89,6 +89,11 @@ pub enum ToolError {
     #[error("Worker {worker_id} crashed or disconnected during {last_op}")]
     WorkerCrashed { worker_id: usize, last_op: String },
 
+    /// The supervising parent killed the worker that was serving this call
+    /// because it overran its deadline; the database it held is gone.
+    #[error("{0}")]
+    WorkerRetired(String),
+
     /// A signal caught inside an IDA SDK call. The worker that reported it
     /// discards its database; a pool parent retires the child.
     #[error("{0}")]
@@ -126,7 +131,9 @@ impl ToolError {
     /// retirement of a debug-pinned worker, whatever retired it.
     pub fn is_fatal(&self) -> bool {
         match self {
-            ToolError::SdkCrashed(_) | ToolError::DebuggerSessionLost(_) => true,
+            ToolError::SdkCrashed(_)
+            | ToolError::DebuggerSessionLost(_)
+            | ToolError::WorkerRetired(_) => true,
             ToolError::NoDatabaseOpen
             | ToolError::DatabaseAlreadyOpen(_)
             | ToolError::OpenFailed(_)

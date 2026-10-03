@@ -74,10 +74,21 @@ wait_response 4 "$dir/out.log" 60 | jq -e '.result.isError != true' >/dev/null |
 # per-call bound is 5s; the router adds its own grace before killing.
 started=$(date +%s)
 send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import time\ntime.sleep(600)","timeout_secs":5}}}'
+# The router's own operation record must show the script executing while
+# the child is stuck (phases do not cross the transport, so the router
+# reports what it knows).
+sleep 2
+send '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
+wait_response 50 "$dir/out.log" 10 | text | grep -q '"executing"' || { echo "FAIL: recent_operations does not show the stuck script as executing" >&2; exit 1; }
 stuck_resp="$(wait_response 5 "$dir/out.log" 60)" || { echo "FAIL: the stuck call never returned" >&2; exit 1; }
 elapsed=$(( $(date +%s) - started ))
 echo "$stuck_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: stuck call did not return an error" >&2; echo "$stuck_resp" >&2; exit 1; }
-echo "$stuck_resp" | text | grep -qi 'timed out\|timeout' || { echo "FAIL: stuck call error is not a timeout" >&2; echo "$stuck_resp" >&2; exit 1; }
+# The typed retirement error, not the generic script timeout: it tells the
+# agent the database is gone and to reopen.
+stuck_text="$(echo "$stuck_resp" | text)"
+if ! { grep -q 'killed worker' <<<"$stuck_text" && grep -q 'open_idb again' <<<"$stuck_text"; }; then
+  echo "FAIL: stuck call error does not report the retirement and recovery" >&2; echo "$stuck_resp" >&2; exit 1
+fi
 [[ $elapsed -le 30 ]] || { echo "FAIL: stuck call took ${elapsed}s to return" >&2; exit 1; }
 echo "   ✓ stuck call returned a timeout after ${elapsed}s"
 
@@ -96,8 +107,25 @@ second_child="$(child_pids "$dir/out.log" | tail -1)"
 send '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"resolve_function","arguments":{"name":"saved_before_hang"}}}'
 wait_response 8 "$dir/out.log" 30 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: the edit saved before the hang is missing" >&2; exit 1; }
 echo "   ✓ reopened on child $second_child with the saved rename intact"
-send '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
-wait_response 9 "$dir/out.log" 30 >/dev/null
+# A read tool stuck inside IDA (an output hook that never returns) must be
+# bounded by the supervisor too, and the retirement must be the call's
+# top-level error even though search normally folds per-item failures.
+send '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import ida_idp, time\nclass Stuck(ida_idp.IDP_Hooks):\n    def ev_out_insn(self, ctx):\n        time.sleep(600)\n        return 0\nstuck_hook = Stuck()\nstuck_hook.hook()"}}}'
+wait_response 10 "$dir/out.log" 30 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: could not install the stuck output hook" >&2; exit 1; }
+stuck_child="$(child_pids "$dir/out.log" | tail -1)"
+started=$(date +%s)
+send '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search","arguments":{"targets":["ret"],"kind":"text","limit":5,"timeout_secs":2}}}'
+read_resp="$(wait_response 11 "$dir/out.log" 60)" || { echo "FAIL: the stuck read tool never returned" >&2; exit 1; }
+elapsed=$(( $(date +%s) - started ))
+echo "$read_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: stuck read tool did not return a top-level error" >&2; echo "$read_resp" >&2; exit 1; }
+echo "$read_resp" | text | grep -q 'killed worker' || { echo "FAIL: stuck read tool error does not report the retirement" >&2; echo "$read_resp" >&2; exit 1; }
+[[ $elapsed -le 30 ]] || { echo "FAIL: stuck read tool took ${elapsed}s to return" >&2; exit 1; }
+for _ in $(seq 1 10); do kill -0 "$stuck_child" 2>/dev/null || break; sleep 1; done
+if kill -0 "$stuck_child" 2>/dev/null; then echo "FAIL: child $stuck_child stuck in a read tool is still running" >&2; exit 1; fi
+echo "   ✓ stuck read tool returned the retirement error after ${elapsed}s and child $stuck_child is gone"
+send '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":5}}}'
+wait_response 12 "$dir/out.log" 30 | text | grep -q 'No database is currently open' || { echo "FAIL: a later read tool did not report the database as closed" >&2; exit 1; }
+echo "   ✓ later calls answer immediately with no database open"
 exec 3>&-
 wait "$pid" 2>/dev/null || true
 pid=

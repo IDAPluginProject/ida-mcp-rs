@@ -611,7 +611,10 @@ fn run_server_with_mode(
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    let worker = IdaWorker::new(tx);
+    let worker = match mode {
+        ServerMode::Worker => IdaWorker::supervised(tx),
+        ServerMode::Stdio | ServerMode::Http => IdaWorker::new(tx),
+    };
     let backend = WorkerBackend::local(Arc::new(worker.clone()));
     let sdk_crash = ida_mcp::crash_guard::SdkCrashSignal::default();
     let sdk_crash_for_server = sdk_crash.clone();
