@@ -14,6 +14,24 @@
 </p>
 <br>
 
+## Why ida-mcp
+
+- **Built for Apple targets.** Universal Mach-O slice selection, dSYM/DWARF
+  loading, and dyld_shared_cache module and dylib loading are single tool
+  calls with explicit parameters, not scripts the agent has to write. In a
+  measured Claude Code run, selecting and analyzing the x86_64 slice of a
+  universal binary took one call and about five seconds.
+- **Fast and lean.** A native Rust server driving IDA in-process; a 28-tool
+  `--profile=lean` measured 25% cheaper than the full set on real tasks with
+  the same correctness, and the full set is there when you need it.
+- **Safe to leave running.** Exact-target edits, `save_idb` checkpoints,
+  analysis flushed to disk as soon as it finishes, graceful shutdown on every
+  signal a client sends, and database state discarded rather than trusted
+  after an IDA crash.
+- **Scriptable when the tools run out.** `run_script` returns a trailing
+  expression as JSON and keeps state between calls, so one script can find,
+  filter, and return only what matters.
+
 ## Prerequisites
 
 - IDA Pro 9.4 with a valid license
@@ -304,7 +322,19 @@ Requirements:
 ## IDAPython scripting
 
 `run_script` runs Python in the open database through IDA's IDAPython engine
-and returns what the script wrote to stdout and stderr.
+and returns what the script wrote to stdout and stderr. A trailing expression
+is returned as `result`, so a script can compute, filter, and hand back only
+what matters:
+
+- `result` is strict JSON of at most 1 MiB. A larger result fails the call
+  rather than being truncated; return a smaller value or print a summary.
+- A value that is not JSON-serializable (custom objects, `NaN`/`Infinity`,
+  circular references) is returned as the string of its `repr()` with
+  `result_is_repr: true`. So is any value containing an integer outside
+  −2⁶³ … 2⁶⁴−1, which the server's JSON reader cannot hold exactly.
+
+Imports, variables, and functions persist between calls on the same open
+database.
 
 ```
 # Inline script
@@ -313,12 +343,61 @@ run_script(code: "import idautils\nfor f in idautils.Functions():\n    print(hex
 # Run a .py file from disk
 run_script(file: "/path/to/analysis_script.py")
 
+# Build state in one call, return a value from the next
+run_script(code: "import idautils\nfuncs = list(idautils.Functions())")
+run_script(code: "{'count': len(funcs), 'first': hex(funcs[0])}")
+
 # With timeout (default 120s, max 600s)
 run_script(code: "import ida_bytes; print(ida_bytes.get_bytes(0x1000, 16).hex())",
            timeout_secs: 30)
 ```
 
 All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API reference](https://python.docs.hex-rays.com).
+
+## Structured results
+
+`analysis_status`, `list_functions`, `resolve_function`, `function_at`,
+`xrefs_to`, `xrefs_from`, and `strings` advertise an `outputSchema` and return
+`structuredContent` alongside the same JSON as text. Other tools return JSON
+text only; tools whose result is a bare array or a per-call shape have no
+schema yet.
+
+## Saving and crash handling
+
+`save_idb` writes the open database to disk without closing it and returns
+the database path it wrote. Use it to checkpoint renames, comments, types, and
+patches; `close_idb` also saves. If the client exits without closing, the
+server attempts a graceful shutdown on stdin EOF and on SIGTERM, SIGINT,
+SIGQUIT, or SIGHUP, which closes and packs the open database; the log names
+the signal. That attempt is bounded (the process exits a few seconds after the
+signal even if a client never closes stdin), a SIGKILL skips it, and a caught
+SDK crash deliberately discards unsaved changes, so `save_idb` remains the
+only guarantee for edits. Finished auto-analysis is flushed to the database
+as soon as a raw open or `analyze_funcs` completes, because some MCP clients
+(Claude Code among them) end servers with SIGKILL when the conversation ends;
+after such a kill the analysis is on disk and only later edits are lost.
+
+If a call crashes inside the IDA SDK (SIGSEGV/SIGBUS), ida-mcp returns an error
+for that call (a top-level error even from batch tools that normally report
+per-item failures) and then stops using that database state: the database is closed
+without saving, so changes since the last `save_idb` are lost, and pooled or
+workspace child workers are replaced. Call `open_idb` again to continue.
+
+The default stdio server and single-worker HTTP host IDA in the server process
+itself, so after a crash they keep running in a process whose native state may
+be damaged. Pooled HTTP (`--max-workers N`) and `--workspace` run IDA in child
+processes that are killed and replaced instead.
+
+### Removed tools
+
+| Removed | Use instead |
+|---|---|
+| `list_funcs` | `list_functions` (same parameters) |
+| `get_u8`, `get_u16`, `get_u32`, `get_u64` | `read_int` with `size` 1, 2, 4, or 8 |
+| `int_convert` | no replacement; do the conversion client-side or in `run_script` |
+
+Update `--tools` / `--exclude-tools` lists that name the removed tools; an
+unknown name is rejected at startup.
 
 ## Multiple databases and HTTP
 
@@ -483,7 +562,7 @@ doesn't modify the database.
 
 ## Context optimization
 
-By default `tools/list` returns 75 tools. The full tool list is roughly 12k
+By default `tools/list` returns 71 tools. The full tool list is roughly 12k
 tokens, estimated at four characters per token. Seven more are opt-in: the six
 debugger tools and `list_databases` appear only with
 `--enable-debugger` or `--workspace`. Clients with dynamic tool discovery defer
@@ -492,20 +571,52 @@ surface to what you need:
 
 | Flag | Env var | Effect |
 |---|---|---|
+| `--profile=lean`       | `IDA_MCP_PROFILE`       | Starts from the 28-tool `lean` set (below) instead of all tools |
 | `--toolsets=cat1,cat2` | `IDA_MCP_TOOLSETS` | Replaces "all tools" with the union of selected categories |
 | `--tools=t1,t2`        | `IDA_MCP_TOOLS`         | Adds individual tools (additive to `--toolsets`) |
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
-| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
+| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `save_idb`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-With no flags you get all 75 baseline tools. Categories: `core`, `functions`,
+With no flags you get all 71 baseline tools (51.9 KB of schemas). Categories: `core`, `functions`,
 `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
 `metadata`, `types`, `editing`, `scripting`; `debug` exists only when the
 debugger is enabled on a supported platform (run `tool_catalog` to list them).
 Flags override env vars, and unknown names are rejected at startup.
 
+### The `lean` profile
+
+`--profile=lean` advertises 28 tools, about 26 KB of schemas, chosen for Apple
+reverse engineering: opening binaries, caches and debug info
+(`open_idb`, `open_dsc`, `dsc_add_dylib`, `dsc_add_region`, `load_debug_info`,
+`analysis_status`, `analyze_funcs`, `save_idb`, `close_idb`, `task_status`),
+reading code and references (`list_functions`, `resolve_function`,
+`function_at`, `disasm`, `decompile`, `xrefs_to`, `xrefs_from`, `callers`,
+`callees`, `strings`, `find_bytes`, `search`, `segments`, `imports`,
+`exports`), annotating (`rename`, `set_comments`), and `run_script` for
+everything else. `tool_catalog`/`tool_help` are left out because the schemas
+are already advertised; the server instructions adapt to whatever is enabled.
+The profile composes with the other flags: `--tools` adds to it,
+`--exclude-tools` and `--read-only` subtract (`--profile=lean --read-only` is
+21 tools, 21.8 KB). The default stays the full set for compatibility; the
+profile is the measured recommendation for Claude Code (below).
+
+```bash
+ida-mcp --profile=lean
+```
+
+Measured with `bench/` (Claude Code 2.1.288, Sonnet 5.5, medium effort,
+three trials per cell, 2026-10-03) on an annotate / string-xrefs / universal
+Mach-O task mix: both profiles completed all nine conversations correctly.
+Lean cost 25% less than full ($0.275 vs $0.367), used 42 vs 52 tool calls,
+and recorded 0 vs 1 MCP tool errors; cache-read input fell from 849,325 to
+442,166 tokens. The saving is almost all cache-read tokens from the smaller
+inventory, so it applies to clients that send the tool list with every
+request. No other client was measured.
+
 ### Recommendations by client
 
-- **Claude Code, Cursor:** nothing to do for context usage. Both defer MCP tool schemas and load them on demand. Filtering still helps if you want to limit what the agent can do.
+- **Claude Code:** use `--profile=lean` for Apple RE work; it was 25% cheaper than the full set on the measured tasks with the same correctness. Add `--tools` for anything specific you need beyond it.
+- **Cursor:** defers MCP tool schemas and loads them on demand, so filtering is mainly about limiting what the agent can do; not measured.
 - **Codex CLI:** current models with tool search defer MCP tools automatically. For models without tool search, or to limit what the agent can do, pick a focused subset:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
