@@ -23,6 +23,8 @@ pub(crate) fn json_object(value: Value) -> Result<JsonObject, ToolError> {
     }
 }
 
+const NOT_SUPPORTED_PREFIX: &str = "Not supported: ";
+
 /// `_meta` key a child worker sets on a result when its IDA thread caught an
 /// SDK crash while producing it. Result text is user-controlled (script
 /// output, exception messages), so the parent retires on this key only.
@@ -121,6 +123,12 @@ fn classify_child_error(message: String) -> ToolError {
     if let Some(detail) = message.strip_prefix(DEBUGGER_START_RETAINED_PREFIX) {
         return ToolError::DebuggerStartRetained(detail.to_string());
     }
+    // Callers downgrade NotSupported to a warning (open_dsc on an existing
+    // database without the dscu service), so the type must survive the
+    // child boundary. The prefix is NotSupported's own Display.
+    if let Some(detail) = message.strip_prefix(NOT_SUPPORTED_PREFIX) {
+        return ToolError::NotSupported(detail.to_string());
+    }
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("worker channel closed") {
         return ToolError::WorkerClosed;
@@ -214,6 +222,19 @@ mod tests {
         mark_sdk_crashed(&mut marked);
         let err = sdk_crash(&marked, "run_script").expect("marked result is a crash");
         assert!(matches!(err, ToolError::SdkCrashed(message) if message == crash_text));
+    }
+
+    /// A child's NotSupported must reach the parent as NotSupported: open_dsc
+    /// turns exactly that type into a warning instead of failing the open.
+    #[test]
+    fn not_supported_survives_the_child_boundary() {
+        let child = ToolError::NotSupported("IDA dscu service is not available".to_string())
+            .to_tool_result();
+        let err = parse_value(child, "dsc_add_dylib").expect_err("stays an error");
+        assert!(
+            matches!(&err, ToolError::NotSupported(message) if message == "IDA dscu service is not available"),
+            "{err:?}"
+        );
     }
 
     /// Batch tools fold a per-item crash into a successful result; the marker
