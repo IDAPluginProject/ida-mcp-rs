@@ -31,7 +31,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
@@ -3469,9 +3469,46 @@ fn drain_stderr_chunk(worker_id: usize, pending: &mut Vec<u8>, mut chunk: &[u8])
     }
 }
 
+/// Severity a child's formatted log line was written at, so the parent can
+/// re-log it at the same level. The child applies the user's RUST_LOG itself
+/// (it inherits the environment), so whatever reaches its stderr was asked
+/// for; demoting it all to DEBUG hid the whole IDA-side log at the default
+/// `ida_mcp=info`. Lines without a recognizable level are raw IDA output.
+fn child_line_level(line: &str) -> tracing::Level {
+    let plain: String = {
+        let mut out = String::with_capacity(line.len());
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    match plain.split_whitespace().nth(1) {
+        Some("ERROR") => tracing::Level::ERROR,
+        Some("WARN") => tracing::Level::WARN,
+        Some("INFO") => tracing::Level::INFO,
+        Some("TRACE") => tracing::Level::TRACE,
+        Some(_) | None => tracing::Level::DEBUG,
+    }
+}
+
 fn log_stderr_line(worker_id: usize, line: &[u8]) {
     let line = String::from_utf8_lossy(line);
-    debug!(target: "ida_mcp::worker_stderr", worker_id, line = %line);
+    match child_line_level(&line) {
+        tracing::Level::ERROR => error!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
+        tracing::Level::WARN => warn!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
+        tracing::Level::INFO => info!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
+        tracing::Level::TRACE => trace!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
+        _ => debug!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
+    }
 }
 
 #[cfg(test)]
@@ -4025,6 +4062,26 @@ mod tests {
         assert!(!release_error_retires_worker(&ToolError::IdaError(
             "No database is currently open".to_string()
         )));
+    }
+
+    #[test]
+    fn child_log_lines_keep_their_level() {
+        use crate::ida::pool::child_line_level;
+        let colored = "\u{1b}[2m2026-10-04T02:34:58.052742Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mida_mcp::ida::loop_impl\u{1b}[0m: Database opened";
+        assert_eq!(child_line_level(colored), tracing::Level::INFO);
+        assert_eq!(
+            child_line_level("2026-10-04T02:34:58Z  WARN ida_mcp: careful"),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            child_line_level("2026-10-04T02:34:58Z ERROR ida_mcp: bad"),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            child_line_level("Symbolicate Plugin initialized."),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(child_line_level(""), tracing::Level::DEBUG);
     }
 
     /// A wait that ended before the worker took the call must never release
