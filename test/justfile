@@ -71,6 +71,7 @@ test: fixture
     # copy of the raw fixture and its database so the shared fixture is never
     # changed and the test can be rerun.
     work="$(mktemp -d)"
+    trap 'rm -rf "$work" "$tmp"' EXIT
     cp "{{ test_bin }}" "$work/mini"
     [ -d "{{ test_bin }}.dSYM" ] && cp -R "{{ test_bin }}.dSYM" "$work/mini.dSYM"
     [ -f "{{ test_i64 }}" ] && cp "{{ test_i64 }}" "$work/mini.i64"

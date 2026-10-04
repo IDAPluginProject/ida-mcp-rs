@@ -31,7 +31,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, warn};
 
 const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
@@ -68,6 +68,22 @@ pub struct ChildSlot {
     id: usize,
     child: Mutex<PooledChild>,
     call_lock: Mutex<()>,
+    /// Calls waiting for or holding `call_lock`; bounded so a client that
+    /// pipelines requests cannot retain unbounded work behind a busy child.
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+/// Most calls that may wait on one child at once, matching the in-process
+/// worker's request channel capacity.
+const CHILD_QUEUE_CAPACITY: usize = 64;
+
+/// Releases a slot's queue position when a call finishes or is dropped.
+struct QueuedCall<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for QueuedCall<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct PooledChild {
@@ -488,6 +504,7 @@ impl WorkerPool {
                 pending_open_artifacts: None,
             }),
             call_lock: Mutex::new(()),
+            queued: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -604,7 +621,11 @@ impl WorkerPool {
             Self::finish_dead_worker(slot.id, dead).await;
         }
         if replenish {
-            self.ensure_min_workers().await;
+            // Detached: a replacement that starts slowly or hangs in its
+            // handshake must not hold up the retirement error of the call
+            // that triggered this, which is already past its deadline.
+            let pool = self.clone();
+            tokio::spawn(async move { pool.ensure_min_workers().await });
         }
     }
 
@@ -793,6 +814,11 @@ impl PooledWorkerHandle {
         // its database are untouched; retirement applies only to a call that
         // actually ran.
         let admitted = Instant::now();
+        if self.slot.queued.fetch_add(1, Ordering::SeqCst) >= CHILD_QUEUE_CAPACITY {
+            self.slot.queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(ToolError::Busy);
+        }
+        let _queued = QueuedCall(&self.slot.queued);
         let _call_guard = {
             let lock = self.slot.call_lock.lock();
             tokio::pin!(lock);
@@ -3462,52 +3488,26 @@ fn drain_stderr_chunk(worker_id: usize, pending: &mut Vec<u8>, mut chunk: &[u8])
 
     pending.extend_from_slice(chunk);
     if pending.len() > STDERR_LINE_LIMIT_BYTES {
-        let truncated = &pending[..STDERR_LINE_LIMIT_BYTES];
-        let line = String::from_utf8_lossy(truncated);
-        debug!(target: "ida_mcp::worker_stderr", worker_id, line = %line, truncated = true);
+        let mut truncated = pending[..STDERR_LINE_LIMIT_BYTES].to_vec();
+        truncated.extend_from_slice(b" [truncated]");
+        log_stderr_line(worker_id, &truncated);
         pending.clear();
     }
 }
 
-/// Severity a child's formatted log line was written at, so the parent can
-/// re-log it at the same level. The child applies the user's RUST_LOG itself
-/// (it inherits the environment), so whatever reaches its stderr was asked
-/// for; demoting it all to DEBUG hid the whole IDA-side log at the default
-/// `ida_mcp=info`. Lines without a recognizable level are raw IDA output.
-fn child_line_level(line: &str) -> tracing::Level {
-    let plain: String = {
-        let mut out = String::with_capacity(line.len());
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
-    match plain.split_whitespace().nth(1) {
-        Some("ERROR") => tracing::Level::ERROR,
-        Some("WARN") => tracing::Level::WARN,
-        Some("INFO") => tracing::Level::INFO,
-        Some("TRACE") => tracing::Level::TRACE,
-        Some(_) | None => tracing::Level::DEBUG,
-    }
-}
-
+/// Write one line of a child's stderr to the parent's stderr unchanged. The
+/// child formats and filters its own log with the user's RUST_LOG (it
+/// inherits the environment), so re-logging it under another target would
+/// filter it a second time and drop target-scoped lines; raw IDA console
+/// output reaches the same place it did when IDA ran in-process.
 fn log_stderr_line(worker_id: usize, line: &[u8]) {
-    let line = String::from_utf8_lossy(line);
-    match child_line_level(&line) {
-        tracing::Level::ERROR => error!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
-        tracing::Level::WARN => warn!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
-        tracing::Level::INFO => info!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
-        tracing::Level::TRACE => trace!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
-        _ => debug!(target: "ida_mcp::worker_stderr", worker_id, line = %line),
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr().lock();
+    if let Err(err) = stderr
+        .write_all(line)
+        .and_then(|()| stderr.write_all(b"\n"))
+    {
+        debug!(worker_id, error = %err, "failed to relay child stderr line");
     }
 }
 
@@ -4064,36 +4064,21 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn child_log_lines_keep_their_level() {
-        use crate::ida::pool::child_line_level;
-        let colored = "\u{1b}[2m2026-10-04T02:34:58.052742Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mida_mcp::ida::loop_impl\u{1b}[0m: Database opened";
-        assert_eq!(child_line_level(colored), tracing::Level::INFO);
-        assert_eq!(
-            child_line_level("2026-10-04T02:34:58Z  WARN ida_mcp: careful"),
-            tracing::Level::WARN
-        );
-        assert_eq!(
-            child_line_level("2026-10-04T02:34:58Z ERROR ida_mcp: bad"),
-            tracing::Level::ERROR
-        );
-        assert_eq!(
-            child_line_level("Symbolicate Plugin initialized."),
-            tracing::Level::DEBUG
-        );
-        assert_eq!(child_line_level(""), tracing::Level::DEBUG);
-    }
-
     /// A wait that ended before the worker took the call must never release
     /// the lease the healthy call still holds.
     #[test]
     fn never_dispatched_errors_keep_the_lease() {
-        let queued = ToolError::NeverDispatched("cancelled while queued".to_string());
-        assert!(!open_error_releases_lease(false, &queued));
-        assert!(!open_error_releases_lease(true, &queued));
-        assert!(!queued.is_fatal());
-        assert!(queued.never_dispatched());
-        assert!(!release_error_retires_worker(&queued));
+        for queued in [
+            ToolError::NeverDispatched("cancelled while queued".to_string()),
+            // A full admission queue also rejects before dispatch.
+            ToolError::Busy,
+        ] {
+            assert!(!open_error_releases_lease(false, &queued));
+            assert!(!open_error_releases_lease(true, &queued));
+            assert!(!queued.is_fatal());
+            assert!(queued.never_dispatched());
+            assert!(!release_error_retires_worker(&queued));
+        }
     }
 
     #[test]

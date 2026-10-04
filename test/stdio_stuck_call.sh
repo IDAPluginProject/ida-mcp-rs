@@ -121,6 +121,18 @@ echo "$queued_resp" | text | grep -q 'waiting for the IDA worker' || { echo "FAI
 [[ $elapsed -le 20 ]] || { echo "FAIL: queued call took ${elapsed}s" >&2; exit 1; }
 send '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
 wait_response 63 "$dir/out.log" 10 | text | grep -q '"queued"' || { echo "FAIL: the queued call was not recorded as queued" >&2; exit 1; }
+# A client that pipelines far more calls than the admission bound gets the
+# excess rejected as busy instead of having them all held behind the worker.
+for i in $(seq 100 175); do
+  send "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"tools/call\",\"params\":{\"name\":\"list_functions\",\"arguments\":{\"limit\":1,\"timeout_secs\":120}}}"
+done
+busy_seen=
+for _ in $(seq 1 10); do
+  if grep -q 'Server is busy' "$dir/out.log"; then busy_seen=1; break; fi
+  sleep 1
+done
+[[ -n "$busy_seen" ]] || { echo "FAIL: pipelined calls past the admission bound were not rejected as busy" >&2; exit 1; }
+echo "   ✓ calls past the admission bound were rejected as busy"
 # Cancelling a queued read and a queued open likewise end only the wait.
 send '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":30}}}'
 send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:66,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
@@ -196,5 +208,26 @@ while kill -0 "$child" 2>/dev/null; do
   if [[ $waited -ge 45 ]]; then echo "FAIL: orphaned stuck child $child still running after ${waited}s" >&2; exit 1; fi
 done
 echo "   ✓ orphaned stuck child $child exited within ${waited}s"
+
+# ---------------------------------------------------------------------------
+echo "── target-scoped logging reaches the user through the child ──"
+dir="$work/logging"; db="$dir/mini.i64"
+mkdir -p "$dir"
+mkfifo "$dir/stdin.fifo"
+RUST_LOG=ida_mcp::ida::loop_impl=info "$BIN" serve < "$dir/stdin.fifo" > "$dir/out.log" 2>&1 &
+pid=$!
+exec 3>"$dir/stdin.fifo"
+send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"stuck-test","version":"0.1"},"capabilities":{}}}'
+send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+wait_response 1 "$dir/out.log" 10 >/dev/null
+cp "$IDB_PATH" "$db"
+send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
+wait_response 2 "$dir/out.log" 120 >/dev/null
+sed 's/\x1b\[[0-9;]*m//g' "$dir/out.log" | grep -q 'ida_mcp::ida::loop_impl.*Database opened' || {
+  echo "FAIL: a target-scoped RUST_LOG did not show the child's loop_impl log" >&2; exit 1; }
+exec 3>&-
+wait "$pid" 2>/dev/null || true
+pid=
+echo "   ✓ RUST_LOG=ida_mcp::ida::loop_impl=info shows the child's database-open line"
 
 echo "✅ stuck-call test passed"

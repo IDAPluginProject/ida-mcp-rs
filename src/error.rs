@@ -175,7 +175,7 @@ impl ToolError {
     /// Whether the call never reached the worker (its wait was cancelled or
     /// timed out), so no lease, handle, or worker state may be touched.
     pub fn never_dispatched(&self) -> bool {
-        if let ToolError::NeverDispatched(_) = self {
+        if let ToolError::NeverDispatched(_) | ToolError::Busy = self {
             return true;
         }
         false
