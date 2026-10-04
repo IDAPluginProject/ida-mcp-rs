@@ -17,6 +17,7 @@ work="$(mktemp -d)"
 pid=
 cleanup() {
   exec 3>&- 2>/dev/null || true
+  exec 4>&- 2>/dev/null || true
   if [[ -n "$pid" ]]; then kill -9 "$pid" 2>/dev/null || true; fi
   rm -rf "$work"
 }
@@ -121,22 +122,18 @@ echo "$queued_resp" | text | grep -q 'waiting for the IDA worker' || { echo "FAI
 [[ $elapsed -le 20 ]] || { echo "FAIL: queued call took ${elapsed}s" >&2; exit 1; }
 send '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
 wait_response 63 "$dir/out.log" 10 | text | grep -q '"queued"' || { echo "FAIL: the queued call was not recorded as queued" >&2; exit 1; }
-# A client that pipelines far more calls than the admission bound gets the
-# excess rejected as busy instead of having them all held behind the worker.
-for i in $(seq 100 175); do
-  send "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"tools/call\",\"params\":{\"name\":\"list_functions\",\"arguments\":{\"limit\":1,\"timeout_secs\":120}}}"
-done
-busy_seen=
-for _ in $(seq 1 10); do
-  if grep -q 'Server is busy' "$dir/out.log"; then busy_seen=1; break; fi
-  sleep 1
-done
-[[ -n "$busy_seen" ]] || { echo "FAIL: pipelined calls past the admission bound were not rejected as busy" >&2; exit 1; }
-echo "   ✓ calls past the admission bound were rejected as busy"
 # Cancelling a queued read and a queued open likewise end only the wait.
 send '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":30}}}'
 send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:66,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
 sleep 1
+send '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
+wait_response 64 "$dir/out.log" 10 | text | jq -e '.active_operation.tool == "open_idb" and .active_operation.status == "queued"' >/dev/null || { echo "FAIL: the cancellation target did not enter the worker queue" >&2; exit 1; }
+# Neither request may have finished (for example, with Busy) before we
+# cancel it. The healthy script still owns the only worker's call lock.
+if grep -E '"id":(65|66)[,}]' "$dir/out.log" | grep -q '"jsonrpc"'; then
+  echo "FAIL: a cancellation target finished before it could be cancelled" >&2
+  exit 1
+fi
 send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":65,"reason":"test"}}'
 send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":66,"reason":"test"}}'
 # The finite call completes normally despite everything queued behind it.
@@ -150,6 +147,23 @@ state_resp="$(wait_response 67 "$dir/out.log" 30)"
 send '{"jsonrpc":"2.0","id":68,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
 wait_response 68 "$dir/out.log" 30 | text | jq -e '.function_count' >/dev/null || { echo "FAIL: the database was unreachable after queued failures" >&2; exit 1; }
 echo "   ✓ queued timeout and cancellations left the worker $busy_child, its database, and its state intact"
+
+# Exercise admission independently so its flood cannot mask cancellation.
+send '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import time\ntime.sleep(15)\nqueued_marker","timeout_secs":45}}}'
+sleep 1
+for i in $(seq 100 175); do
+  send "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"tools/call\",\"params\":{\"name\":\"list_functions\",\"arguments\":{\"limit\":1,\"timeout_secs\":120}}}"
+done
+busy_seen=
+for _ in $(seq 1 10); do
+  if grep -q 'Server is busy' "$dir/out.log"; then busy_seen=1; break; fi
+  sleep 1
+done
+[[ -n "$busy_seen" ]] || { echo "FAIL: pipelined calls past the admission bound were not rejected as busy" >&2; exit 1; }
+wait_response 80 "$dir/out.log" 60 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: admission flood broke the running call" >&2; exit 1; }
+for i in $(seq 100 175); do wait_response "$i" "$dir/out.log" 30 >/dev/null; done
+[[ "$(child_pids "$dir/out.log" | tail -1)" == "$busy_child" ]] || { echo "FAIL: admission flood retired the healthy worker" >&2; exit 1; }
+echo "   ✓ calls past the admission bound were rejected as busy"
 
 # A read tool stuck inside IDA (an output hook that never returns) must be
 # bounded by the supervisor too, and the retirement must be the call's
@@ -229,5 +243,33 @@ exec 3>&-
 wait "$pid" 2>/dev/null || true
 pid=
 echo "   ✓ RUST_LOG=ida_mcp::ida::loop_impl=info shows the child's database-open line"
+
+# ---------------------------------------------------------------------------
+echo "── an unread stderr pipe cannot stop the supervisor watchdog ──"
+dir="$work/stderr"; db="$dir/mini.i64"
+mkdir -p "$dir"
+mkfifo "$dir/stdin.fifo" "$dir/stderr.fifo"
+# Keep a reader present without consuming bytes. Native writes fill this pipe.
+exec 4<>"$dir/stderr.fifo"
+RUST_LOG=ida_mcp=info "$BIN" serve < "$dir/stdin.fifo" > "$dir/out.log" 2> "$dir/stderr.fifo" &
+pid=$!
+exec 3>"$dir/stdin.fifo"
+send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"stderr-test","version":"0.1"},"capabilities":{}}}'
+send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+wait_response 1 "$dir/out.log" 10 >/dev/null
+cp "$IDB_PATH" "$db"
+send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
+wait_response 2 "$dir/out.log" 120 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: stderr probe could not open its fixture" >&2; exit 1; }
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import os\nfor _ in range(256):\n    os.write(2, b\"F\" * 4095 + b\"\\n\")\n42","timeout_secs":2}}}'
+stderr_resp="$(wait_response 3 "$dir/out.log" 30)" || { echo "FAIL: unread stderr stopped the watchdog" >&2; exit 1; }
+echo "$stderr_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: native stderr did not fill the pipe" >&2; exit 1; }
+echo "$stderr_resp" | text | grep -q 'killed worker' || { echo "FAIL: stderr probe did not report retirement" >&2; exit 1; }
+exec 4>&-
+exec 3>&-
+for _ in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+if kill -0 "$pid" 2>/dev/null; then echo "FAIL: stderr logger blocked server shutdown" >&2; exit 1; fi
+wait "$pid" 2>/dev/null || true
+pid=
+echo "   ✓ the watchdog retired the child with stderr still unread"
 
 echo "✅ stuck-call test passed"

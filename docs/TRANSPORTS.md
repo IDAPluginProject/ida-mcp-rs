@@ -188,6 +188,11 @@ Scope the filter when troubleshooting: `RUST_LOG=ida_mcp=debug`. A bare
 `RUST_LOG=debug` also enables the MCP SDK's own request logging, which writes
 whole JSON-RPC envelopes — including tool arguments — to stderr.
 
+Application logs use a nonblocking stderr queue capped at 256 events and
+16 KiB per event. Oversized events are truncated and excess events are dropped
+when the reader falls behind, so logging cannot stop worker deadlines or hold
+shutdown open. Child processes inherit stderr directly.
+
 ## Known limitations
 
 - **Sessionless `close_token` recovery outside workspace mode.** Under MCP 2026

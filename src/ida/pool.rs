@@ -26,20 +26,26 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
+const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
 // A close_idb RPC can spend its enqueue and debugger teardown budgets before
 // packing the database and sending its response. Its parent watchdog must
 // leave the same post-child grace as every other pooled operation.
 const MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS: u64 =
     CLOSE_SEND_TIMEOUT_SECS + DEBUGGER_TEARDOWN_TIMEOUT_SECS as u64 + CHILD_TIMEOUT_GRACE_SECS;
+
+#[cfg(all(test, unix))]
+#[path = "pool_startup_tests.rs"]
+mod startup_tests;
 
 #[derive(Debug, Clone)]
 pub struct WorkerPoolConfig {
@@ -56,12 +62,18 @@ pub struct WorkerPoolConfig {
 pub struct WorkerPool {
     inner: Arc<Mutex<PoolInner>>,
     config: Arc<WorkerPoolConfig>,
+    shutdown: CancellationToken,
+    shutdown_lock: Arc<Mutex<()>>,
+    startups: TaskTracker,
+    startup_timeout: Duration,
 }
 
 struct PoolInner {
     children: Vec<Arc<ChildSlot>>,
     spawning: HashSet<usize>,
     next_id: usize,
+    shutting_down: bool,
+    replenishment: JoinSet<()>,
 }
 
 pub struct ChildSlot {
@@ -90,7 +102,6 @@ struct PooledChild {
     service: Option<RunningService<RoleClient, ParentClientHandler>>,
     peer: Peer<RoleClient>,
     pid: Option<u32>,
-    stderr_task: JoinHandle<()>,
     state: ChildState,
     spawned_at: Instant,
     last_used: Instant,
@@ -216,6 +227,7 @@ struct SpawnReservation {
     worker_id: usize,
     runtime: Option<Handle>,
     cleanup_slot: Option<Arc<ChildSlot>>,
+    tracked: Option<TaskTrackerToken>,
     armed: bool,
 }
 
@@ -275,11 +287,13 @@ impl Drop for WorkerRetireGuard {
 
 impl SpawnReservation {
     fn new(pool: WorkerPool, worker_id: usize) -> Self {
+        let tracked = Some(pool.startups.token());
         Self {
             pool,
             worker_id,
             runtime: Handle::try_current().ok(),
             cleanup_slot: None,
+            tracked,
             armed: true,
         }
     }
@@ -288,13 +302,15 @@ impl SpawnReservation {
         self.worker_id
     }
 
-    async fn finish(mut self, slot: Option<Arc<ChildSlot>>) {
+    async fn finish(mut self, slot: Option<Arc<ChildSlot>>) -> Result<(), ToolError> {
         self.cleanup_slot = slot.clone();
-        self.pool
+        let result = self
+            .pool
             .finish_spawn_reservation(self.worker_id, slot)
             .await;
         self.cleanup_slot = None;
         self.armed = false;
+        result
     }
 }
 
@@ -307,6 +323,7 @@ impl Drop for SpawnReservation {
         let pool = self.pool.clone();
         let worker_id = self.worker_id;
         let cleanup_slot = self.cleanup_slot.take();
+        let tracked = self.tracked.take();
         let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
         let Some(runtime) = runtime else {
             warn!(
@@ -317,14 +334,16 @@ impl Drop for SpawnReservation {
         };
 
         runtime.spawn(async move {
+            // Shutdown waits until this cleanup has released the reservation.
+            let _tracked = tracked;
             warn!(
                 worker_id,
                 "spawn reservation was dropped before worker installation completed"
             );
-            pool.finish_spawn_reservation(worker_id, None).await;
             if let Some(slot) = cleanup_slot {
-                pool.mark_dead(&slot).await;
+                pool.discard_uninstalled_slot(&slot).await;
             }
+            let _ = pool.finish_spawn_reservation(worker_id, None).await;
         });
     }
 }
@@ -336,15 +355,21 @@ impl WorkerPool {
                 children: Vec::new(),
                 spawning: HashSet::new(),
                 next_id: 0,
+                shutting_down: false,
+                replenishment: JoinSet::new(),
             })),
             config: Arc::new(config),
+            shutdown: CancellationToken::new(),
+            shutdown_lock: Arc::new(Mutex::new(())),
+            startups: TaskTracker::new(),
+            startup_timeout: CHILD_STARTUP_TIMEOUT,
         }
     }
 
     pub async fn warm_min(&self) -> Result<(), ToolError> {
         let min = self.config.min_workers.min(self.config.max_workers);
         for _ in 0..min {
-            let reservation = self.reserve_spawn_slot().await;
+            let reservation = self.reserve_spawn_slot().await?;
             self.spawn_reserved_slot(reservation, ChildState::Idle)
                 .await?;
         }
@@ -355,6 +380,9 @@ impl WorkerPool {
         let session_id = session_id.to_string();
         let reservation = {
             let mut inner = self.inner.lock().await;
+            if inner.shutting_down {
+                return Err(ToolError::WorkerClosed);
+            }
             let mut active = inner.spawning.len();
             let mut dead_ids = Vec::new();
 
@@ -395,7 +423,7 @@ impl WorkerPool {
                 });
             }
 
-            self.reserve_spawn_slot_locked(&mut inner)
+            self.reserve_spawn_slot_locked(&mut inner)?
         };
 
         let id = reservation.worker_id();
@@ -428,33 +456,62 @@ impl WorkerPool {
         let id = reservation.worker_id();
         match self.spawn_slot(id, initial_state).await {
             Ok(slot) => {
-                reservation.finish(Some(slot.clone())).await;
+                reservation.finish(Some(slot.clone())).await?;
                 Ok(slot)
             }
             Err(err) => {
-                reservation.finish(None).await;
+                let _ = reservation.finish(None).await;
                 Err(err)
             }
         }
     }
 
-    async fn reserve_spawn_slot(&self) -> SpawnReservation {
+    async fn reserve_spawn_slot(&self) -> Result<SpawnReservation, ToolError> {
         let mut inner = self.inner.lock().await;
         self.reserve_spawn_slot_locked(&mut inner)
     }
 
-    fn reserve_spawn_slot_locked(&self, inner: &mut PoolInner) -> SpawnReservation {
+    fn reserve_spawn_slot_locked(
+        &self,
+        inner: &mut PoolInner,
+    ) -> Result<SpawnReservation, ToolError> {
+        if inner.shutting_down {
+            return Err(ToolError::WorkerClosed);
+        }
         let id = inner.next_id;
-        inner.next_id += 1;
+        inner.next_id = id.checked_add(1).ok_or_else(|| {
+            ToolError::RemoteProtocol("worker identifier space exhausted".to_string())
+        })?;
         inner.spawning.insert(id);
-        SpawnReservation::new(self.clone(), id)
+        Ok(SpawnReservation::new(self.clone(), id))
     }
 
-    async fn finish_spawn_reservation(&self, worker_id: usize, slot: Option<Arc<ChildSlot>>) {
+    async fn finish_spawn_reservation(
+        &self,
+        worker_id: usize,
+        slot: Option<Arc<ChildSlot>>,
+    ) -> Result<(), ToolError> {
         let mut inner = self.inner.lock().await;
-        inner.spawning.remove(&worker_id);
+        if inner.shutting_down {
+            drop(inner);
+            if let Some(slot) = slot {
+                self.discard_uninstalled_slot(&slot).await;
+            }
+            self.inner.lock().await.spawning.remove(&worker_id);
+            return Err(ToolError::WorkerClosed);
+        }
         if let Some(slot) = slot {
             inner.children.push(slot);
+        }
+        inner.spawning.remove(&worker_id);
+        Ok(())
+    }
+
+    async fn discard_uninstalled_slot(&self, slot: &Arc<ChildSlot>) {
+        let dead = self.take_dead_worker(slot).await;
+        self.forget_slot(slot.id).await;
+        if let Some(dead) = dead {
+            Self::finish_dead_worker(slot.id, dead).await;
         }
     }
 
@@ -474,20 +531,33 @@ impl WorkerPool {
         id: usize,
         initial_state: ChildState,
     ) -> Result<Arc<ChildSlot>, ToolError> {
+        if self.shutdown.is_cancelled() {
+            return Err(ToolError::WorkerClosed);
+        }
         let cmd = self.worker_command();
 
-        let (transport, stderr) = TokioChildProcess::builder(cmd)
-            .stderr(Stdio::piped())
+        // Let the child own stderr backpressure. Relaying it with blocking
+        // writes on the supervisor's runtime can stop its watchdog timers.
+        let (transport, _) = TokioChildProcess::builder(cmd)
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|err| {
                 ToolError::RemoteProtocol(format!("failed to spawn worker {id}: {err}"))
             })?;
         let pid = transport.id();
-        let stderr_task = spawn_stderr_relay(id, stderr);
         let handler = ParentClientHandler;
-        let service = handler.serve(transport).await.map_err(|err| {
-            ToolError::RemoteProtocol(format!("failed to initialize worker {id}: {err}"))
-        })?;
+        let service = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return Err(ToolError::WorkerClosed),
+            result = tokio::time::timeout(self.startup_timeout, handler.serve(transport)) => {
+                result.map_err(|_| ToolError::RemoteProtocol(format!(
+                    "worker {id} startup timed out after {} seconds",
+                    self.startup_timeout.as_secs()
+                )))?.map_err(|err| ToolError::RemoteProtocol(format!(
+                    "failed to initialize worker {id}: {err}"
+                )))?
+            }
+        };
         let peer = service.peer().clone();
         info!(worker_id = id, pid = ?pid, "spawned IDA child worker");
         Ok(Arc::new(ChildSlot {
@@ -496,7 +566,6 @@ impl WorkerPool {
                 service: Some(service),
                 peer,
                 pid,
-                stderr_task,
                 state: initial_state,
                 spawned_at: Instant::now(),
                 last_used: Instant::now(),
@@ -621,11 +690,7 @@ impl WorkerPool {
             Self::finish_dead_worker(slot.id, dead).await;
         }
         if replenish {
-            // Detached: a replacement that starts slowly or hangs in its
-            // handshake must not hold up the retirement error of the call
-            // that triggered this, which is already past its deadline.
-            let pool = self.clone();
-            tokio::spawn(async move { pool.ensure_min_workers().await });
+            self.schedule_replenishment().await;
         }
     }
 
@@ -685,7 +750,6 @@ impl WorkerPool {
         let pid = child.pid;
         let age_secs = child.spawned_at.elapsed().as_secs();
         let service = child.service.take();
-        child.stderr_task.abort();
         DeadWorker {
             service,
             pid,
@@ -715,34 +779,57 @@ impl WorkerPool {
         );
     }
 
-    async fn ensure_min_workers(&self) {
+    async fn schedule_replenishment(&self) {
         let min_workers = self.config.min_workers.min(self.config.max_workers);
-        if min_workers == 0 {
-            return;
+        let mut inner = self.inner.lock().await;
+        while let Some(result) = inner.replenishment.try_join_next() {
+            if let Err(error) = result {
+                warn!(%error, "worker replenishment task failed");
+            }
         }
-
-        loop {
-            let reservation = {
-                let mut inner = self.inner.lock().await;
-                let live_or_reserved = inner.spawning.len() + inner.children.len();
-                if live_or_reserved >= min_workers || live_or_reserved >= self.config.max_workers {
+        while !inner.shutting_down
+            && inner.spawning.len().saturating_add(inner.children.len()) < min_workers
+        {
+            let reservation = match self.reserve_spawn_slot_locked(&mut inner) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    warn!(%error, "failed to reserve a replacement worker");
                     return;
                 }
-                self.reserve_spawn_slot_locked(&mut inner)
             };
-
             let worker_id = reservation.worker_id();
-            if let Err(err) = self
-                .spawn_reserved_slot(reservation, ChildState::Idle)
-                .await
-            {
-                warn!(worker_id, error = %err, "failed to replenish minimum pooled worker");
-                return;
-            }
+            let pool = self.clone();
+            // Reserve before spawning so all scheduled work counts against
+            // capacity and shutdown can account for it immediately.
+            inner.replenishment.spawn(async move {
+                if let Err(error) = pool
+                    .spawn_reserved_slot(reservation, ChildState::Idle)
+                    .await
+                    && !pool.shutdown.is_cancelled()
+                {
+                    warn!(worker_id, %error, "failed to replenish minimum pooled worker");
+                }
+            });
         }
     }
 
     pub async fn shutdown_all(&self) {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        let mut replenishment = {
+            let mut inner = self.inner.lock().await;
+            inner.shutting_down = true;
+            self.shutdown.cancel();
+            self.startups.close();
+            std::mem::take(&mut inner.replenishment)
+        };
+        while let Some(result) = replenishment.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "worker replenishment task failed during shutdown");
+            }
+        }
+        // Also wait for direct lease/warm-up handshakes and their cancellation
+        // cleanup. The closed pool cannot create any new reservations.
+        self.startups.wait().await;
         let slots = {
             let inner = self.inner.lock().await;
             inner.children.clone()
@@ -3447,70 +3534,6 @@ fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
         )
 }
 
-const STDERR_CHUNK_BYTES: usize = 4096;
-const STDERR_LINE_LIMIT_BYTES: usize = 16 * 1024;
-
-fn spawn_stderr_relay(
-    worker_id: usize,
-    stderr: Option<tokio::process::ChildStderr>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(mut stderr) = stderr else {
-            return;
-        };
-        let mut chunk = [0_u8; STDERR_CHUNK_BYTES];
-        let mut pending = Vec::new();
-
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => drain_stderr_chunk(worker_id, &mut pending, &chunk[..n]),
-                Err(err) => {
-                    warn!(worker_id, error = %err, "failed to read child stderr");
-                    break;
-                }
-            }
-        }
-
-        if !pending.is_empty() {
-            log_stderr_line(worker_id, &pending);
-        }
-    })
-}
-
-fn drain_stderr_chunk(worker_id: usize, pending: &mut Vec<u8>, mut chunk: &[u8]) {
-    while let Some(pos) = chunk.iter().position(|byte| *byte == b'\n') {
-        pending.extend_from_slice(&chunk[..pos]);
-        log_stderr_line(worker_id, pending);
-        pending.clear();
-        chunk = &chunk[pos + 1..];
-    }
-
-    pending.extend_from_slice(chunk);
-    if pending.len() > STDERR_LINE_LIMIT_BYTES {
-        let mut truncated = pending[..STDERR_LINE_LIMIT_BYTES].to_vec();
-        truncated.extend_from_slice(b" [truncated]");
-        log_stderr_line(worker_id, &truncated);
-        pending.clear();
-    }
-}
-
-/// Write one line of a child's stderr to the parent's stderr unchanged. The
-/// child formats and filters its own log with the user's RUST_LOG (it
-/// inherits the environment), so re-logging it under another target would
-/// filter it a second time and drop target-scoped lines; raw IDA console
-/// output reaches the same place it did when IDA ran in-process.
-fn log_stderr_line(worker_id: usize, line: &[u8]) {
-    use std::io::Write as _;
-    let mut stderr = std::io::stderr().lock();
-    if let Err(err) = stderr
-        .write_all(line)
-        .and_then(|()| stderr.write_all(b"\n"))
-    {
-        debug!(worker_id, error = %err, "failed to relay child stderr line");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
@@ -4251,7 +4274,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_reservation_counts_toward_pool_capacity() {
         let pool = test_pool(1);
-        let reservation = pool.reserve_spawn_slot().await;
+        let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
 
         assert_eq!(pool.live_or_reserved_count().await, 1);
         let err = match pool.lease("session-b").await {
@@ -4266,14 +4289,14 @@ mod tests {
             other => panic!("unexpected lease error: {other}"),
         }
 
-        reservation.finish(None).await;
+        reservation.finish(None).await.expect("release reservation");
         assert_eq!(pool.live_or_reserved_count().await, 0);
     }
 
     #[tokio::test]
     async fn dropped_spawn_reservation_releases_pool_capacity() {
         let pool = test_pool(1);
-        let reservation = pool.reserve_spawn_slot().await;
+        let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
         drop(reservation);
 
         for _ in 0..10 {

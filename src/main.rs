@@ -40,6 +40,8 @@ use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod logging;
+
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
 
@@ -336,8 +338,9 @@ struct ProbeArgs {
 
 fn main() -> anyhow::Result<()> {
     // Initialize logging to stderr (stdout is used for MCP protocol)
+    let (log_writer, mut log_guard) = logging::stderr()?;
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().with_writer(log_writer))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("ida_mcp=info")))
         .init();
 
@@ -357,7 +360,7 @@ fn main() -> anyhow::Result<()> {
     let allow_lumina = cli.ida_network.allow_lumina;
     let mut worker_args = cli.ida_network.worker_args();
     worker_args.extend(cli.debugger.worker_args());
-    match cli.command.unwrap_or(Command::Serve) {
+    let result = match cli.command.unwrap_or(Command::Serve) {
         Command::Serve if workspace.workspace => {
             run_server_workspace(build_filter()?, worker_args, workspace)
         }
@@ -369,7 +372,12 @@ fn main() -> anyhow::Result<()> {
             run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
         }
         Command::Probe(args) => run_probe(args, allow_lumina),
-    }
+    };
+    let log_result = match log_guard.shutdown() {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        outcome => outcome.map(|_| ()).map_err(anyhow::Error::from),
+    };
+    result.and(log_result)
 }
 
 /// Waits for a shutdown signal and logs which one arrived, so a receipt can
