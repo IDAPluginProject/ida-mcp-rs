@@ -2522,6 +2522,66 @@ impl WorkspaceDatabase {
         .await
     }
 
+    pub async fn list_lvars(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListLvarsResult, ToolError> {
+        self.call_json(
+            "list_lvars",
+            json!({
+                "address": addr.map(remote::hex_addr), "target_name": name,
+                "offset": offset, "limit": limit, "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn rename_lvar(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        lvar_name: String,
+        new_name: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RenameLvarResult, ToolError> {
+        self.call_json(
+            "rename_lvar",
+            json!({
+                "address": addr.map(remote::hex_addr), "target_name": name,
+                "lvar_name": lvar_name, "new_name": new_name, "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn set_lvar_type(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        lvar_name: String,
+        decl: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetLvarTypeResult, ToolError> {
+        self.call_json(
+            "set_lvar_type",
+            json!({
+                "address": addr.map(remote::hex_addr), "target_name": name,
+                "lvar_name": lvar_name, "decl": decl, "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
     pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
         self.call_json("segments", json!({}), None, None).await
     }

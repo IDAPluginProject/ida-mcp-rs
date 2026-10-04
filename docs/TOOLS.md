@@ -5,7 +5,7 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns 71 baseline tools by default (78 registered including opt-in workspace and debugger tools)
+- `tools/list` returns 74 baseline tools by default (81 registered including opt-in workspace and debugger tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`
@@ -70,6 +70,7 @@ Decompile functions to pseudocode (requires Hex-Rays)
 | Tool | Description |
 |------|-------------|
 | `decompile` | Decompile one or more functions to C pseudocode |
+| `list_lvars` | List decompiler locals and arguments in one function |
 | `pseudocode_at` | Get pseudocode for one or more addresses/ranges |
 
 ## Xrefs (`xrefs`)
@@ -150,6 +151,7 @@ Types, structs, and stack variable info
 | `local_types` | List local types |
 | `read_struct` | Read struct instances at one or more addresses |
 | `search_structs` | Search structs by name |
+| `set_lvar_type` | Set the type of one exact decompiler local variable |
 | `stack_frame` | Get stack frame info for one function |
 | `struct_info` | Get struct info by name or ordinal |
 | `structs` | List structs with pagination |
@@ -165,6 +167,7 @@ Patching, renaming, and comment editing
 | `patch` | Patch bytes at an address |
 | `patch_asm` | Patch instructions with assembly text |
 | `rename` | Rename symbols |
+| `rename_lvar` | Rename one exact decompiler local variable |
 | `set_comments` | Set comments at an address |
 
 ## Debug (`debug`)

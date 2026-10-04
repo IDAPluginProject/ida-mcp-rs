@@ -236,6 +236,23 @@ A returned `target` record identifies the database, resolved symbol (or `null`),
 and requested and effective addresses. Check the operation's result to determine
 whether the change succeeded.
 
+For Hex-Rays locals and arguments, use `list_lvars` with one function address
+or exact `target_name`. `rename_lvar` and `set_lvar_type` take the same function
+selector plus an exact, unique `lvar_name`. They return the variable as it was
+before the edit and the resolved function target. The edits appear in subsequent
+decompilations; use `save_idb` to checkpoint them to disk.
+
+```text
+list_lvars(target_name: "interesting_function")
+rename_lvar(target_name: "interesting_function", lvar_name: "v1", new_name: "count")
+set_lvar_type(target_name: "interesting_function", lvar_name: "count", decl: "unsigned int")
+save_idb()
+```
+
+`list_lvars` is in the `decompile` toolset, `rename_lvar` in `editing`, and
+`set_lvar_type` in `types`. Add them to lean with
+`--profile=lean --tools=list_lvars,rename_lvar,set_lvar_type`.
+
 ## Opening binaries
 
 ### Raw blobs
@@ -357,10 +374,12 @@ All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API
 ## Structured results
 
 `analysis_status`, `list_functions`, `resolve_function`, `function_at`,
-`xrefs_to`, `xrefs_from`, and `strings` advertise an `outputSchema` and return
-`structuredContent` alongside the same JSON as text. Other tools return JSON
-text only; tools whose result is a bare array or a per-call shape have no
-schema yet.
+`xrefs_to`, `xrefs_from`, `strings`, and `list_lvars` advertise an
+`outputSchema` and return `structuredContent` alongside the same JSON as
+text. `rename_lvar` and `set_lvar_type` also return structured results but
+omit their output schemas to keep the tool inventory smaller. Other tools
+return JSON text only; tools whose result is a bare array or a per-call shape
+have no schema yet.
 
 ## Saving and crash handling
 
@@ -569,7 +588,7 @@ doesn't modify the database.
 
 ## Context optimization
 
-By default `tools/list` returns 71 tools. The full tool list is roughly 13k
+By default `tools/list` returns 74 tools. The full tool list is roughly 14k
 tokens, estimated at four characters per token. Seven more are opt-in: the six
 debugger tools and `list_databases` appear only with
 `--enable-debugger` or `--workspace`. Clients with dynamic tool discovery defer
@@ -584,7 +603,7 @@ surface to what you need:
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
 | `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `save_idb`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-With no flags you get all 71 baseline tools (52.4 KB of schemas). Categories: `core`, `functions`,
+With no flags you get all 74 baseline tools (57.2 KB of schemas). Categories: `core`, `functions`,
 `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
 `metadata`, `types`, `editing`, `scripting`; `debug` exists only when the
 debugger is enabled on a supported platform (run `tool_catalog` to list them).
@@ -628,7 +647,7 @@ request. No other client was measured.
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
   ```
-- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~13k tokens. Pick a focused subset as shown above.
+- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~14k tokens. Pick a focused subset as shown above.
 - **Gemini CLI:** filtering is optional, but a smaller surface cuts down on wrong tool picks when several MCP servers are enabled:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile --read-only

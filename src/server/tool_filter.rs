@@ -26,6 +26,8 @@ pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "patch",
     "patch_asm",
     "rename",
+    "rename_lvar",
+    "set_lvar_type",
     "set_comments",
     "lumina_apply",
     "declare_type",
@@ -374,6 +376,35 @@ mod tests {
     }
 
     #[test]
+    fn lvar_tools_follow_read_and_write_categories() {
+        let reading = ToolFilter::from_inputs(
+            &cat("core,functions,disassembly,decompile,xrefs"),
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(reading.is_enabled("list_lvars"));
+        assert!(!reading.is_enabled("rename_lvar"));
+        assert!(!reading.is_enabled("set_lvar_type"));
+
+        for (category, included, excluded) in [
+            ("editing", "rename_lvar", "set_lvar_type"),
+            ("types", "set_lvar_type", "rename_lvar"),
+        ] {
+            let filter = ToolFilter::from_inputs(&cat(category), &[], &[], false).unwrap();
+            assert!(
+                filter.is_enabled(included),
+                "{category} must include {included}"
+            );
+            assert!(
+                !filter.is_enabled(excluded),
+                "{category} must exclude {excluded}"
+            );
+        }
+    }
+
+    #[test]
     fn exclude_tools_wins_over_includes() {
         let f =
             ToolFilter::from_inputs(&cat("core"), &cat("run_script"), &cat("run_script"), false)
@@ -403,6 +434,7 @@ mod tests {
             "idb_meta",
             "load_debug_info",
             "lumina_lookup",
+            "list_lvars",
         ] {
             assert!(f.is_enabled(name), "read-only must keep {name}");
         }
@@ -496,7 +528,7 @@ mod tests {
         let err = ToolFilter::from_inputs(
             &cat("decompile"),
             &[],
-            &cat("decompile,pseudocode_at"),
+            &cat("decompile,pseudocode_at,list_lvars"),
             false,
         )
         .expect_err("exclude wiping all includes must reject");

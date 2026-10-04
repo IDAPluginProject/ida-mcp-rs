@@ -4391,6 +4391,96 @@ impl IdaMcpServer {
     }
 
     #[tool(
+        description = "List Hex-Rays locals and arguments in one function. Select one address or exact target_name; returns names, types, locations, and pagination."
+    )]
+    async fn list_lvars(
+        &self,
+        Parameters(req): Parameters<ListLvarsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let offset =
+            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
+        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit")).unwrap_or(100);
+        if !(1..=1000).contains(&limit) {
+            return Ok(
+                ToolError::InvalidParams("limit must be between 1 and 1000".into())
+                    .to_tool_result(),
+            );
+        }
+        let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        match self
+            .worker
+            .list_lvars(addr, req.target_name, offset, limit, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Persistently rename one Hex-Rays local variable. Select an exact function target and the exact, unique lvar_name from list_lvars. Returns the old variable and resolved target; save_idb writes the database to disk."
+    )]
+    async fn rename_lvar(
+        &self,
+        Parameters(req): Parameters<RenameLvarRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        match self
+            .worker
+            .rename_lvar(
+                addr,
+                req.target_name,
+                req.lvar_name,
+                req.new_name,
+                Some(timeout),
+            )
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Persistently set one Hex-Rays local variable's C type. Select an exact function target and exact, unique lvar_name from list_lvars. Rejects invalid or incompatible types; save_idb writes the database to disk."
+    )]
+    async fn set_lvar_type(
+        &self,
+        Parameters(req): Parameters<SetLvarTypeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        match self
+            .worker
+            .set_lvar_type(
+                addr,
+                req.target_name,
+                req.lvar_name,
+                req.decl,
+                Some(timeout),
+            )
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
         description = "Get decompiled pseudocode at one or more addresses or address ranges. \
         Unlike 'decompile' which returns the full function, this returns only the statements \
         that correspond to the given address(es). Useful for getting pseudocode for a basic block \
@@ -6894,6 +6984,16 @@ fn typed_result<T: Serialize + std::fmt::Debug>(value: &T) -> CallToolResult {
     result
 }
 
+fn lvar_timeout(value: Option<i64>) -> Result<u64, ToolError> {
+    let seconds = parse_optional_unsigned::<u64>(value, "timeout_secs")?.unwrap_or(120);
+    if !(1..=MAX_TIMEOUT_SECS).contains(&seconds) {
+        return Err(ToolError::InvalidParams(
+            "timeout_secs must be between 1 and 600".into(),
+        ));
+    }
+    Ok(seconds)
+}
+
 /// `analysis_status` as a client sees it: the worker's status plus the
 /// session that answered (absent inside a child worker).
 #[derive(Debug, Serialize, JsonSchema)]
@@ -6937,23 +7037,29 @@ enum XrefsOutput {
 /// added explicitly because schemars leaves the root of an `anyOf` untyped.
 fn tool_output_schema(name: &str) -> Option<Value> {
     fn schema<T: JsonSchema>() -> Value {
-        let mut value = serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}));
-        normalize_schema_value(&mut value);
-        if let Value::Object(root) = &mut value {
-            root.entry("type").or_insert_with(|| json!("object"));
-        }
-        value
+        serde_json::to_value(schema_for!(T)).unwrap_or_else(|_| json!({}))
     }
 
-    match name {
-        "analysis_status" => Some(schema::<AnalysisStatusOutput>()),
-        "list_functions" => Some(schema::<crate::ida::types::FunctionListResult>()),
-        "resolve_function" => Some(schema::<crate::ida::types::FunctionInfo>()),
-        "function_at" => Some(schema::<crate::ida::types::FunctionRangeInfo>()),
-        "strings" => Some(schema::<crate::ida::types::StringListResult>()),
-        "xrefs_to" | "xrefs_from" => Some(schema::<XrefsOutput>()),
-        _ => None,
+    let mut value = match name {
+        "analysis_status" => schema::<AnalysisStatusOutput>(),
+        "list_functions" => schema::<crate::ida::types::FunctionListResult>(),
+        "resolve_function" => schema::<crate::ida::types::FunctionInfo>(),
+        "function_at" => schema::<crate::ida::types::FunctionRangeInfo>(),
+        "list_lvars" => schema::<crate::ida::types::ListLvarsResult>(),
+        "strings" => schema::<crate::ida::types::StringListResult>(),
+        "xrefs_to" | "xrefs_from" => schema::<XrefsOutput>(),
+        _ => return None,
+    };
+    // list_lvars can report a target with a null database or symbol. Keep
+    // those nulls without widening the existing tools' output contracts.
+    if name != "list_lvars" {
+        normalize_schema_value(&mut value);
     }
+    if let Value::Object(root) = &mut value {
+        root.remove("$schema");
+        root.entry("type").or_insert_with(|| json!("object"));
+    }
+    Some(value)
 }
 
 fn tool_params_schema(name: &str) -> Option<Value> {
@@ -6998,6 +7104,9 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "disasm_by_name" => Some(schema::<DisasmByNameRequest>()),
         "disasm_function_at" => Some(schema::<DisasmFunctionAtRequest>()),
         "decompile" => Some(schema::<DecompileRequest>()),
+        "list_lvars" => Some(schema::<ListLvarsRequest>()),
+        "rename_lvar" => Some(schema::<RenameLvarRequest>()),
+        "set_lvar_type" => Some(schema::<SetLvarTypeRequest>()),
         "pseudocode_at" => Some(schema::<PseudocodeAtRequest>()),
 
         // Xrefs / Control flow
@@ -7360,10 +7469,12 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
         "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
         | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
-        | "rename" | "set_comments" | "debug_open_module" => ToolAnnotations::new()
-            .read_only(false)
-            .destructive(name == "close_idb")
-            .open_world(false),
+        | "rename" | "rename_lvar" | "set_lvar_type" | "set_comments" | "debug_open_module" => {
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(name == "close_idb")
+                .open_world(false)
+        }
         _ => ToolAnnotations::new()
             .read_only(true)
             .destructive(false)
@@ -7975,8 +8086,9 @@ mod tests {
     #[test]
     fn output_schemas_match_the_structured_results() {
         use crate::ida::types::{
-            AnalysisStatus, FunctionInfo, FunctionListResult, FunctionRangeInfo, StringInfo,
-            StringListResult, XRefInfo, XRefListResult,
+            AnalysisStatus, FunctionInfo, FunctionListResult, FunctionRangeInfo, ListLvarsResult,
+            LocalVariableInfo, MutationTarget, StringInfo, StringListResult, TargetSelector,
+            XRefInfo, XRefListResult,
         };
 
         let advertised: Vec<&str> = crate::tool_registry::all_tools()
@@ -7990,6 +8102,7 @@ mod tests {
                 "list_functions",
                 "resolve_function",
                 "function_at",
+                "list_lvars",
                 "xrefs_to",
                 "xrefs_from",
                 "strings",
@@ -8003,10 +8116,12 @@ mod tests {
                 schema["type"], "object",
                 "{name} output schema lacks a root type: {schema}"
             );
-            assert!(
-                schema.get("$schema").is_none(),
-                "{name} schema keeps $schema"
-            );
+            assert!(!contains_schema_key(&schema), "{name} schema keeps $schema");
+            if *name != "list_lvars" {
+                let mut normalized = schema.clone();
+                normalize_schema_value(&mut normalized);
+                assert_eq!(schema, normalized, "{name} widened its output schema");
+            }
         }
 
         let function = FunctionInfo {
@@ -8023,6 +8138,24 @@ mod tests {
             }],
             truncated: false,
             next_offset: None,
+        };
+        let target = MutationTarget {
+            database: None,
+            selector: TargetSelector::Address,
+            symbol: None,
+            base: "0x1000".into(),
+            requested_address: "0x1004".into(),
+            address: "0x1000".into(),
+        };
+        let variable = LocalVariableInfo {
+            name: "v1".into(),
+            type_name: "int".into(),
+            location: "w0".into(),
+            definition_address: None,
+            size: Some(4),
+            is_argument: true,
+            has_user_name: false,
+            has_user_type: false,
         };
         let results = [
             (
@@ -8063,6 +8196,15 @@ mod tests {
                     start: "0x1000".into(),
                     end: "0x1020".into(),
                     size: 32,
+                }),
+            ),
+            (
+                "list_lvars",
+                typed_result(&ListLvarsResult {
+                    target,
+                    lvars: vec![variable],
+                    total: 1,
+                    next_offset: None,
                 }),
             ),
             (
@@ -8125,6 +8267,21 @@ mod tests {
             json!({"results": [{"address": "0x1"}]}),
         ] {
             assert!(!validator.is_valid(&invalid), "schema accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn lvar_annotations_match_their_effects() {
+        for (name, read_only) in [
+            ("list_lvars", true),
+            ("rename_lvar", false),
+            ("set_lvar_type", false),
+        ] {
+            assert_eq!(
+                tool_annotations_for(name).read_only_hint,
+                Some(read_only),
+                "{name}"
+            );
         }
     }
 
@@ -9387,7 +9544,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "17f630508e2679c56fc232297269fb2ec473f1126769ae27263333221d440f2a"
+            "07c13372097a22c8e63ada4bf62c51c684fbb8a89262b0ca16499956126486e6"
         );
     }
 

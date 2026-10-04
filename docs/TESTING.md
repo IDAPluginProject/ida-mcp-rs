@@ -18,6 +18,7 @@ just test-universal # Universal (fat) Mach-O slice selection and prompts
 just test-session-cancel # legacy-session cancel-on-disconnect test
 just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
 just test-stuck-call # Stuck-call retirement, immediate reopen, queued calls, orphans
+just test-lvars # Native Hex-Rays local edits, persistence, and read-only filtering
 just test-shutdown-signal # Signal/EOF shutdown saves, hung-close deadline, SIGKILL flush
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
@@ -77,6 +78,12 @@ builds the debug binary before running its harness.
 - Covers `arch` selection, slice-list errors, slice reuse, the thin-file arch
   check, the legacy slice prompt (answered and timed out), and MCP 2026 input
   requests, including one round that also answers the background question
+
+**Local-variable test** (`just test-lvars`)
+- Lists and pages real Hex-Rays locals, then renames and types one exact local
+- Rejects invalid names, missing or conflicting function selectors, and invalid or incompatible types without changing the local
+- Checks updated pseudocode and saved edits after reopening, on default stdio and `--workspace`
+- Confirms read-only mode keeps listing and rejects local edits
 
 **Stuck-call test** (`just test-stuck-call`)
 - Reopens immediately after a stuck call retires the worker, with no sleep or

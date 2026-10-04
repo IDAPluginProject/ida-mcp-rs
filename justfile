@@ -156,6 +156,10 @@ test: build
 test-decompile: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-decompile
 
+# Verify native Hex-Rays local-variable edits, persistence, and filtering.
+test-lvars: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-lvars
+
 # Run HTTP integration test (debug)
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http

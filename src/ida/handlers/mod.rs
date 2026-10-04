@@ -12,6 +12,7 @@ pub mod functions;
 pub mod globals;
 pub mod imports;
 pub mod lumina;
+pub mod lvars;
 pub mod memory;
 pub mod script;
 pub mod search;

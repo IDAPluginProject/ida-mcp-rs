@@ -442,7 +442,7 @@ pub struct StackVarResult {
 }
 
 /// Which selector a mutating tool's caller used for its target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetSelector {
     Address,
@@ -450,7 +450,7 @@ pub enum TargetSelector {
 }
 
 /// The target a mutating tool resolved, recorded before it changed anything.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct MutationTarget {
     /// Database the mutation applied to, as `open_idb` reported it.
     pub database: Option<String>,
@@ -467,6 +467,48 @@ pub struct MutationTarget {
     /// a tool normalizes it; `lumina_apply` acts on the start of the
     /// function containing `requested_address`.
     pub address: String,
+}
+
+/// One local or argument from a Hex-Rays decompilation.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct LocalVariableInfo {
+    pub name: String,
+    pub type_name: String,
+    pub location: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    pub is_argument: bool,
+    pub has_user_name: bool,
+    pub has_user_type: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ListLvarsResult {
+    pub target: MutationTarget,
+    pub lvars: Vec<LocalVariableInfo>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RenameLvarResult {
+    pub target: MutationTarget,
+    /// The local variable before the edit.
+    pub variable: LocalVariableInfo,
+    pub new_name: String,
+    pub renamed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetLvarTypeResult {
+    pub target: MutationTarget,
+    /// The local variable before the edit.
+    pub variable: LocalVariableInfo,
+    pub type_name: String,
+    pub applied: bool,
 }
 
 /// Xrefs to a struct field

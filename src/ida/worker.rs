@@ -616,6 +616,67 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn list_lvars(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListLvarsResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListLvars {
+            addr,
+            name,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
+    }
+
+    pub async fn rename_lvar(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        lvar_name: String,
+        new_name: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RenameLvarResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::RenameLvar {
+            addr,
+            name,
+            lvar_name,
+            new_name,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        self.recv_side_effect(rx, admission, timeout_secs).await
+    }
+
+    pub async fn set_lvar_type(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        lvar_name: String,
+        decl: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetLvarTypeResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::SetLvarType {
+            addr,
+            name,
+            lvar_name,
+            decl,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        self.recv_side_effect(rx, admission, timeout_secs).await
+    }
+
     /// List all segments.
     pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -1872,6 +1933,72 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => worker.decompile(addr).await,
             Self::Pooled(state) => state.decompile(addr).await,
+        }
+    }
+
+    pub async fn list_lvars(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListLvarsResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .list_lvars(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .list_lvars(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn rename_lvar(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        lvar_name: String,
+        new_name: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RenameLvarResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .rename_lvar(addr, name, lvar_name, new_name, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .rename_lvar(addr, name, lvar_name, new_name, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn set_lvar_type(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        lvar_name: String,
+        decl: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetLvarTypeResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .set_lvar_type(addr, name, lvar_name, decl, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .set_lvar_type(addr, name, lvar_name, decl, timeout_secs)
+                    .await
+            }
         }
     }
 

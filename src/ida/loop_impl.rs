@@ -14,7 +14,8 @@ use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::target::TargetSpec;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, debugger, disasm, dscu, functions,
-    globals, imports, lumina, memory, script, search, segments, strings, structs, types, xrefs,
+    globals, imports, lumina, lvars, memory, script, search, segments, strings, structs, types,
+    xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::observability::{
@@ -1031,6 +1032,76 @@ pub fn run_ida_loop(
                         warn!(address = format!("{:#x}", addr), error = %e, "Failed to decompile")
                     }
                 }
+                let _ = resp.send(result);
+            }
+            IdaRequest::ListLvars {
+                addr,
+                name,
+                offset,
+                limit,
+                resp,
+            } => {
+                let result = crash_guard.run("handle_list_lvars", || {
+                    lvars::handle_list_lvars(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
+                        offset,
+                        limit,
+                    )
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::RenameLvar {
+                addr,
+                name,
+                lvar_name,
+                new_name,
+                admission,
+                resp,
+            } => {
+                admit_or_reject!(admission, resp);
+                let result = crash_guard.run("handle_rename_lvar", || {
+                    lvars::handle_rename_lvar(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
+                        &lvar_name,
+                        &new_name,
+                    )
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::SetLvarType {
+                addr,
+                name,
+                lvar_name,
+                decl,
+                admission,
+                resp,
+            } => {
+                admit_or_reject!(admission, resp);
+                let result = crash_guard.run("handle_set_lvar_type", || {
+                    lvars::handle_set_lvar_type(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
+                        &lvar_name,
+                        &decl,
+                    )
+                });
                 let _ = resp.send(result);
             }
             IdaRequest::Segments { resp } => {
@@ -2258,6 +2329,9 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::Disasm { resp, .. } => reject!(resp, err),
         IdaRequest::RenderRange { resp, .. } => reject!(resp, err),
         IdaRequest::Decompile { resp, .. } => reject!(resp, err),
+        IdaRequest::ListLvars { resp, .. } => reject!(resp, err),
+        IdaRequest::RenameLvar { resp, .. } => reject!(resp, err),
+        IdaRequest::SetLvarType { resp, .. } => reject!(resp, err),
         IdaRequest::Segments { resp, .. } => reject!(resp, err),
         IdaRequest::Strings { resp, .. } => reject!(resp, err),
         IdaRequest::LocalTypes { resp, .. } => reject!(resp, err),

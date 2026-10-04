@@ -590,6 +590,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["pseudocode", "decompile", "block", "range", "statement"],
     },
+    ToolInfo {
+        name: "list_lvars",
+        category: ToolCategory::Decompile,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "List decompiler locals and arguments in one function",
+        full_desc: "List Hex-Rays local names, types, locations, and argument flags. Select one address or an exact function symbol; results are paginated.",
+        example: r#"{"target_name": "main", "limit": 100}"#,
+        default: false,
+        keywords: &["decompiler", "locals", "variables", "arguments", "lvars"],
+    },
     // === XREFS ===
     ToolInfo {
         name: "xrefs_to",
@@ -993,6 +1004,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["types", "apply", "annotations"],
     },
     ToolInfo {
+        name: "set_lvar_type",
+        category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Set the type of one exact decompiler local variable",
+        full_desc: "Parse and persist a C type for one Hex-Rays local. Select an exact function and unique local name. Invalid or incompatible types are rejected.",
+        example: r#"{"target_name": "main", "lvar_name": "count", "decl": "unsigned int"}"#,
+        default: false,
+        keywords: &["decompiler", "locals", "variables", "type", "lvars"],
+    },
+    ToolInfo {
         name: "infer_types",
         category: ToolCategory::Types,
         scope: ToolScope::Database,
@@ -1145,6 +1167,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"current_name": "interesting_function", "name": "interesting_function_renamed", "flags": 0}"#,
         default: false,
         keywords: &["rename", "symbol", "edit"],
+    },
+    ToolInfo {
+        name: "rename_lvar",
+        category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Rename one exact decompiler local variable",
+        full_desc: "Persist a Hex-Rays local variable name. Both the function target and local name must resolve exactly; ambiguous names change nothing. Use save_idb to write the database.",
+        example: r#"{"target_name": "main", "lvar_name": "v1", "new_name": "count"}"#,
+        default: false,
+        keywords: &["decompiler", "locals", "variables", "rename", "lvars"],
     },
     // === DEBUGGER (explicit --enable-debugger opt-in) ===
     ToolInfo {
