@@ -17,6 +17,8 @@ just test-elicitation # open_idb auto-background elicitation test
 just test-universal # Universal (fat) Mach-O slice selection and prompts
 just test-session-cancel # legacy-session cancel-on-disconnect test
 just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
+just test-stuck-call # Stuck-call retirement, immediate reopen, queued calls, orphans
+just test-shutdown-signal # Signal/EOF shutdown saves, hung-close deadline, SIGKILL flush
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
 ```
@@ -75,6 +77,27 @@ builds the debug binary before running its harness.
 - Covers `arch` selection, slice-list errors, slice reuse, the thin-file arch
   check, the legacy slice prompt (answered and timed out), and MCP 2026 input
   requests, including one round that also answers the background question
+
+**Stuck-call test** (`just test-stuck-call`)
+- Reopens immediately after a stuck call retires the worker, with no sleep or
+  retry in between (`stdio_reopen.py`)
+- A `run_script` that never returns times out, its child is killed, no
+  database stays bound, and reopening on a fresh child keeps a saved rename
+- Calls queued behind a finite script time out or are cancelled without
+  touching the worker, its database, or Python state; calls past the queue
+  bound are rejected as busy
+- A read tool stuck inside IDA and a worker that exits inside a batch tool
+  both return top-level errors
+- Killing the parent with SIGKILL leaves no orphaned child, target-scoped
+  `RUST_LOG` reaches the child, and an unread stderr pipe cannot stop the
+  watchdog
+
+**Shutdown-signal test** (`just test-shutdown-signal`)
+- SIGTERM and SIGHUP with stdin still open save an unsaved rename and exit,
+  on default stdio and with `--workspace`
+- With IDA's `closebase` hung, SIGTERM, SIGHUP, and stdin EOF still exit
+  within the close deadline and retire the child
+- After SIGKILL, finished auto-analysis is already on disk
 
 **Debugger availability test** (`just test-debugger`)
 - Confirms debugger tools are absent by default and stay hidden on unsupported hosts

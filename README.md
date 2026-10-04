@@ -380,8 +380,9 @@ after such a kill the analysis is on disk and only later edits are lost.
 If a call crashes inside the IDA SDK (SIGSEGV/SIGBUS), ida-mcp returns an error
 for that call (a top-level error even from batch tools that normally report
 per-item failures) and then stops using that database state: the database is closed
-without saving, so changes since the last `save_idb` are lost, and pooled or
-workspace child workers are replaced. Call `open_idb` again to continue.
+without saving, so changes since the last `save_idb` are lost, and the child
+worker is replaced (default stdio, pooled HTTP, and `--workspace`). Call
+`open_idb` again to continue.
 
 The default stdio server runs IDA in one supervised child process (the same
 binary in `worker` mode), as pooled HTTP (`--max-workers N`) and `--workspace`
@@ -568,7 +569,7 @@ doesn't modify the database.
 
 ## Context optimization
 
-By default `tools/list` returns 71 tools. The full tool list is roughly 12k
+By default `tools/list` returns 71 tools. The full tool list is roughly 13k
 tokens, estimated at four characters per token. Seven more are opt-in: the six
 debugger tools and `list_databases` appear only with
 `--enable-debugger` or `--workspace`. Clients with dynamic tool discovery defer
@@ -583,7 +584,7 @@ surface to what you need:
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
 | `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `save_idb`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-With no flags you get all 71 baseline tools (51.9 KB of schemas). Categories: `core`, `functions`,
+With no flags you get all 71 baseline tools (52.4 KB of schemas). Categories: `core`, `functions`,
 `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
 `metadata`, `types`, `editing`, `scripting`; `debug` exists only when the
 debugger is enabled on a supported platform (run `tool_catalog` to list them).
@@ -603,7 +604,7 @@ everything else. `tool_catalog`/`tool_help` are left out because the schemas
 are already advertised; the server instructions adapt to whatever is enabled.
 The profile composes with the other flags: `--tools` adds to it,
 `--exclude-tools` and `--read-only` subtract (`--profile=lean --read-only` is
-21 tools, 21.8 KB). The default stays the full set for compatibility; the
+21 tools, 21.9 KB). The default stays the full set for compatibility; the
 profile is the measured recommendation for Claude Code (below).
 
 ```bash
@@ -627,7 +628,7 @@ request. No other client was measured.
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
   ```
-- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~12k tokens. Pick a focused subset as shown above.
+- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~13k tokens. Pick a focused subset as shown above.
 - **Gemini CLI:** filtering is optional, but a smaller surface cuts down on wrong tool picks when several MCP servers are enabled:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile --read-only

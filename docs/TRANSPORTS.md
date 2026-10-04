@@ -82,8 +82,9 @@ Options (workspace flags are global):
   handle is closed and removed (default 1800; 0 disables database TTL).
 - `--workspace-worker-idle-timeout-secs`: seconds before an idle workspace
   child process is reaped (default 300; 0 disables worker reaping).
-- `--workspace-worker-op-timeout-secs`: workspace child-operation watchdog
-  (default 1800; must be at least 1).
+- `--workspace-worker-op-timeout-secs`: child-operation watchdog for
+  workspace workers and the default stdio worker (default 1800; must be at
+  least 1).
 - `--stateless`: force POST-only mode for legacy protocols. MCP `2026-07-28`
   is always sessionless, with or without this flag.
 - `--json-response`: prefer `application/json` over SSE framing for
