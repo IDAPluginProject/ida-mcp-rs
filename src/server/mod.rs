@@ -1968,6 +1968,12 @@ impl IdaMcpServer {
         cancel_token: &tokio_util::sync::CancellationToken,
         cancel_message: &str,
     ) -> task::TaskSettlement {
+        if error.is_fatal() {
+            return registry.complete_after_fatal_error(
+                task_id,
+                call_tool_result_to_value(&error.to_tool_result()),
+            );
+        }
         registry.complete_with_cancel_token(
             task_id,
             call_tool_result_to_value(&error.to_tool_result()),
@@ -2256,6 +2262,18 @@ impl IdaMcpServer {
             let module_result = worker
                 .dsc_load_image_for_generation(&module, Some(600), Some(database_generation))
                 .await;
+            if let Err(error) = &module_result
+                && error.is_fatal()
+            {
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    error,
+                    &cancel_token,
+                    "Cancelled after the worker was lost",
+                );
+                return;
+            }
             if cancel_token.is_cancelled() {
                 Self::finish_dsc_cancellation_after_open(
                     &task_id,
@@ -2297,6 +2315,18 @@ impl IdaMcpServer {
                 let framework_result = worker
                     .dsc_load_image_for_generation(framework, Some(600), Some(database_generation))
                     .await;
+                if let Err(error) = &framework_result
+                    && error.is_fatal()
+                {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        error,
+                        &cancel_token,
+                        "Cancelled after the worker was lost",
+                    );
+                    return;
+                }
                 if cancel_token.is_cancelled() {
                     Self::finish_dsc_cancellation_after_open(
                         &task_id,
@@ -2329,6 +2359,20 @@ impl IdaMcpServer {
             let analysis_status_result = worker
                 .analysis_status_for_generation(Some(database_generation))
                 .await;
+            if let Err(error) = &analysis_status_result
+                && error.is_fatal()
+            {
+                // The worker already discarded the database; there is
+                // nothing left to close, even when cancellation is pending.
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    error,
+                    &cancel_token,
+                    "Cancelled after the worker was lost",
+                );
+                return;
+            }
             if cancel_token.is_cancelled() {
                 Self::finish_dsc_cancellation_after_open(
                     &task_id,
@@ -2341,18 +2385,6 @@ impl IdaMcpServer {
             }
             analysis_status = match analysis_status_result {
                 Ok(status) => Some(status),
-                Err(err) if err.is_fatal() => {
-                    // The worker already discarded the database; there is
-                    // nothing left to close.
-                    Self::complete_background_tool_error(
-                        &task_id,
-                        &registry,
-                        &err,
-                        &cancel_token,
-                        "Cancelled after the worker was lost",
-                    );
-                    return;
-                }
                 Err(err) => {
                     warn!(module = %module, error = %err, "failed to fetch analysis_status after background open_dsc");
                     None
@@ -6052,9 +6084,10 @@ impl IdaMcpServer {
                     }
                     task::TaskSettlement::Failed | task::TaskSettlement::Unchanged => {}
                 },
-                Err(e) => match registry.complete_with_cancel_token(
+                Err(e) => match Self::complete_background_tool_error(
                     &tid,
-                    call_tool_result_to_value(&e.to_tool_result()),
+                    &registry,
+                    &e,
                     &worker_cancel_token,
                     "Cancelled after auto-analysis settled",
                 ) {
@@ -8191,6 +8224,118 @@ mod tests {
         assert!(first_text(&region).contains("crashed inside the IDA SDK"));
     }
 
+    #[tokio::test]
+    async fn background_dsc_preserves_fatal_loss_at_each_cancel_boundary() {
+        use crate::ida::types::{
+            AnalysisStatus, DatabaseGeneration, DbInfo, DscImageInfo, OpenedDatabase,
+        };
+        use crate::server::{DscBackgroundCtx, DscBackgroundOpen};
+
+        for phase in ["open", "module", "framework", "status"] {
+            let directory = std::env::temp_dir()
+                .join(format!("ida-mcp-dsc-fatal-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).expect("create test directory");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let message = format!("{phase} lost the IDA worker");
+            let worker_message = message.clone();
+            let (server, worker_thread) = scripted_server(move |request| {
+                let fatal = || {
+                    worker_cancel.cancel();
+                    ToolError::SdkCrashed(worker_message.clone())
+                };
+                match request {
+                    crate::IdaRequest::Open { path, resp, .. } => {
+                        let result = if phase == "open" {
+                            Err(fatal())
+                        } else {
+                            Ok(OpenedDatabase {
+                                generation: DatabaseGeneration(1),
+                                info: DbInfo {
+                                    path,
+                                    file_type: "DSC".into(),
+                                    loader: "DSC".into(),
+                                    processor: "ARM".into(),
+                                    bits: 64,
+                                    function_count: 0,
+                                    debug_info: None,
+                                    analysis_status: AnalysisStatus {
+                                        auto_enabled: true,
+                                        auto_is_ok: false,
+                                        auto_state: "AU_NONE".into(),
+                                        auto_state_id: 0,
+                                        analysis_running: true,
+                                    },
+                                },
+                            })
+                        };
+                        resp.send(result).expect("return open result");
+                    }
+                    crate::IdaRequest::DscLoadImage {
+                        module,
+                        admission,
+                        resp,
+                        ..
+                    } => {
+                        admission.start().expect("dispatch image load");
+                        let result = if module == phase {
+                            Err(fatal())
+                        } else {
+                            Ok(DscImageInfo {
+                                index: 0,
+                                name: module.clone(),
+                                file_name: module,
+                                address: "0x1000".into(),
+                                address_value: 0x1000,
+                                total_size: 0x1000,
+                                file_index: None,
+                                loaded: true,
+                            })
+                        };
+                        resp.send(result).expect("return image result");
+                    }
+                    crate::IdaRequest::AnalysisStatus { resp, .. } => {
+                        assert_eq!(phase, "status");
+                        resp.send(Err(fatal())).expect("return status error");
+                    }
+                    _ => panic!("fatal worker loss must not dispatch cleanup"),
+                }
+            });
+            let registry = server.task_registry.clone();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "dsc", "cancel-boundary", "Opening DSC")
+                .expect("create task");
+            IdaMcpServer::run_dsc_background(
+                id.clone(),
+                registry.clone(),
+                server.worker.clone(),
+                crate::ServerMode::Stdio,
+                None,
+                DscBackgroundCtx {
+                    open: DscBackgroundOpen::DirectRawDsc {
+                        open_path: directory.join("cache"),
+                        idb_out: directory.join("cache.i64"),
+                    },
+                    module: "module".into(),
+                    frameworks: vec!["framework".into()],
+                    owner_session_id: None,
+                },
+                cancel,
+            )
+            .await;
+            let value = serde_json::to_value(task_state_to_detailed_task(
+                registry.get(&id).expect("retained DSC task"),
+            ))
+            .expect("serialize MCP task");
+            assert_eq!(value["status"], "completed", "{phase}: {value}");
+            assert_eq!(value["result"]["isError"], true, "{phase}: {value}");
+            assert_eq!(value["result"]["content"][0]["text"], message);
+            drop(server);
+            worker_thread.join().expect("scripted worker exited");
+            std::fs::remove_dir_all(directory).expect("remove test directory");
+        }
+    }
+
     /// Sentinels chosen so a substring hit can only come from the payload we
     /// passed in, never from incidental log text.
     const SECRET_CLOSE_TOKEN: &str = "close-token-9d41f2c7";
@@ -9400,6 +9545,112 @@ mod tests {
         assert_eq!(value["status"], "completed");
         assert_eq!(value["result"]["content"][0]["text"], "done");
         assert_eq!(value["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn background_analysis_preserves_fatal_loss_after_cancellation() {
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let server = IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let id = server
+            .spawn_analyze_funcs_task(&task::TaskOwner::Runtime, cancel.clone())
+            .expect("start background analysis");
+        let request = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("join request receiver")
+            .expect("analysis reached the worker");
+        let crate::IdaRequest::AnalyzeFuncs {
+            admission, resp, ..
+        } = request
+        else {
+            panic!("unexpected worker request");
+        };
+        admission.start().expect("dispatch analysis");
+        assert!(server
+            .task_registry
+            .cancel_for_owner(&task::TaskOwner::Runtime, &id));
+        assert!(cancel.is_cancelled());
+        let error = ToolError::WorkerRetired(
+            "cancelled analyze_funcs; killed worker 7. The database is no longer open; call open_idb again"
+                .to_string(),
+        );
+        let expected = error.to_string();
+        resp.send(Err(error)).expect("return worker retirement");
+
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = server.task_registry.get(&id).expect("retained task");
+                if state.status != task::TaskStatus::Running {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("analysis task settled");
+        let value =
+            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize MCP task");
+        assert_eq!(value["status"], "completed", "{value}");
+        assert_eq!(value["result"]["isError"], true, "{value}");
+        assert_eq!(value["result"]["content"][0]["text"], expected);
+    }
+
+    #[test]
+    fn background_tool_errors_preserve_only_typed_fatal_losses() {
+        for (error, fatal) in [
+            (ToolError::WorkerRetired("worker retired".into()), true),
+            (
+                ToolError::WorkerCrashed {
+                    worker_id: 7,
+                    last_op: "analyze_funcs".into(),
+                },
+                true,
+            ),
+            (ToolError::SdkCrashed("SDK crashed".into()), true),
+            (ToolError::DebuggerSessionLost("session lost".into()), true),
+            (ToolError::NeverDispatched("still queued".into()), false),
+            (ToolError::Cancelled("cancelled".into()), false),
+            (ToolError::IdaError("worker retired".into()), false),
+        ] {
+            let registry = task::TaskRegistry::new();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "test", "fatal-settlement", "Working")
+                .expect("create task");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            registry.set_cancel_token(&id, cancel.clone());
+            assert!(registry.cancel_for_owner(&TASK_OWNER, &id));
+            assert!(cancel.is_cancelled());
+            let expected = if fatal {
+                task::TaskSettlement::Completed
+            } else {
+                task::TaskSettlement::Cancelled
+            };
+            assert_eq!(
+                IdaMcpServer::complete_background_tool_error(
+                    &id,
+                    &registry,
+                    &error,
+                    &cancel,
+                    "Cancelled after work settled",
+                ),
+                expected,
+                "{error:?}"
+            );
+            let state = registry.get(&id).expect("retained task");
+            if fatal {
+                assert_eq!(
+                    state.result,
+                    Some(call_tool_result_to_value(&error.to_tool_result()))
+                );
+            } else {
+                assert!(state.result.is_none());
+            }
+        }
     }
 
     #[test]
