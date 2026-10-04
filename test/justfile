@@ -620,6 +620,7 @@ test-stuck-call: test-bootstrap
         exit 1
     fi
     echo "🧪 Running stuck-call test..."
+    python3 ./stdio_reopen.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
     MCP_STDIO_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" RUST_LOG="{{ rust_log }}" \
         bash ./stdio_stuck_call.sh
     echo "✅ Stuck-call test passed"

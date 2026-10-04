@@ -221,5 +221,7 @@ shutdown open. Child processes inherit stderr directly.
 
 ## Shutdown
 
-The server listens for SIGINT/SIGTERM/SIGQUIT and will close the open database
-before exiting when possible.
+The server listens for SIGINT/SIGTERM/SIGQUIT/SIGHUP and will close the open
+database before exiting when possible. Default stdio also handles stdin EOF.
+It gives database close ten seconds, then shuts down the supervised pool and
+retires any remaining child. Unsaved changes can be lost if closing IDA wedges.

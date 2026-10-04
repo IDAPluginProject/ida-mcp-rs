@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
 const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const POOL_ACQUIRE_CAPACITY: usize = 64;
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
 // A close_idb RPC can spend its enqueue and debugger teardown budgets before
 // packing the database and sending its response. Its parent watchdog must
@@ -66,6 +67,8 @@ pub struct WorkerPool {
     shutdown_lock: Arc<Mutex<()>>,
     startups: TaskTracker,
     startup_timeout: Duration,
+    changed: Arc<Notify>,
+    acquisition_slots: Arc<Semaphore>,
 }
 
 struct PoolInner {
@@ -363,6 +366,8 @@ impl WorkerPool {
             shutdown_lock: Arc::new(Mutex::new(())),
             startups: TaskTracker::new(),
             startup_timeout: CHILD_STARTUP_TIMEOUT,
+            changed: Arc::new(Notify::new()),
+            acquisition_slots: Arc::new(Semaphore::new(POOL_ACQUIRE_CAPACITY)),
         }
     }
 
@@ -377,8 +382,31 @@ impl WorkerPool {
     }
 
     pub async fn lease(&self, session_id: &str) -> Result<PooledWorkerHandle, ToolError> {
+        // Acquire before either pool mutex: a flood of opens must not build
+        // an unbounded queue while a replacement is starting.
+        let _acquisition = self
+            .acquisition_slots
+            .try_acquire()
+            .map_err(|_| ToolError::Busy)?;
+        tokio::time::timeout(self.startup_timeout, self.lease_inner(session_id))
+            .await
+            .map_err(|_| {
+                ToolError::NeverDispatched(format!(
+                    "timed out after {} seconds waiting for an IDA worker to start; \
+                     no database request was dispatched, retry open_idb",
+                    self.startup_timeout.as_secs()
+                ))
+            })?
+    }
+
+    async fn lease_inner(&self, session_id: &str) -> Result<PooledWorkerHandle, ToolError> {
         let session_id = session_id.to_string();
-        let reservation = {
+        let reservation = loop {
+            // Register before observing state so a completed startup cannot
+            // notify between our capacity check and the wait below.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let mut inner = self.inner.lock().await;
             if inner.shutting_down {
                 return Err(ToolError::WorkerClosed);
@@ -417,13 +445,24 @@ impl WorkerPool {
             }
 
             if active >= self.config.max_workers {
-                return Err(ToolError::PoolExhausted {
-                    active,
-                    max: self.config.max_workers,
-                });
+                if inner.spawning.is_empty() {
+                    return Err(ToolError::PoolExhausted {
+                        active,
+                        max: self.config.max_workers,
+                    });
+                }
+                // Reserved startup capacity is not a lease. Wait for its
+                // outcome without holding the pool mutex across the wait.
+                drop(inner);
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => return Err(ToolError::WorkerClosed),
+                    _ = &mut changed => {}
+                }
+                continue;
             }
 
-            self.reserve_spawn_slot_locked(&mut inner)?
+            break self.reserve_spawn_slot_locked(&mut inner)?;
         };
 
         let id = reservation.worker_id();
@@ -498,12 +537,14 @@ impl WorkerPool {
                 self.discard_uninstalled_slot(&slot).await;
             }
             self.inner.lock().await.spawning.remove(&worker_id);
+            self.changed.notify_waiters();
             return Err(ToolError::WorkerClosed);
         }
         if let Some(slot) = slot {
             inner.children.push(slot);
         }
         inner.spawning.remove(&worker_id);
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -643,6 +684,7 @@ impl WorkerPool {
         child.last_used = Instant::now();
         child.idb_path = None;
         child.pending_open_artifacts = None;
+        self.changed.notify_waiters();
         release_guard.disarm();
         info!(
             worker_id = handle.worker_id,
@@ -709,6 +751,7 @@ impl WorkerPool {
     async fn forget_slot(&self, worker_id: usize) {
         let mut inner = self.inner.lock().await;
         inner.children.retain(|slot| slot.id != worker_id);
+        self.changed.notify_waiters();
     }
 
     async fn take_dead_worker(&self, slot: &Arc<ChildSlot>) -> Option<DeadWorker> {
@@ -893,7 +936,7 @@ impl PooledWorkerHandle {
         args: JsonObject,
         timeout: Duration,
         cancel: Option<CancellationToken>,
-        mut open_dispatch: Option<OpenDispatch>,
+        open_dispatch: Option<OpenDispatch>,
         dispatch_progress: Option<DispatchProgress>,
     ) -> Result<CallToolResult, ToolError> {
         // Admission: a call waiting behind another one has started nothing,
@@ -906,49 +949,12 @@ impl PooledWorkerHandle {
             return Err(ToolError::Busy);
         }
         let _queued = QueuedCall(&self.slot.queued);
-        let _call_guard = {
-            let lock = self.slot.call_lock.lock();
-            tokio::pin!(lock);
-            let admission = async {
-                tokio::time::timeout(timeout, &mut lock).await.map_err(|_| {
-                    ToolError::NeverDispatched(format!(
-                        "{tool} timed out after {} seconds waiting for the IDA worker, which is \
-                         still busy with an earlier call; the worker and its database are \
-                         unaffected, retry once that call finishes",
-                        timeout.as_secs()
-                    ))
-                })
-            };
-            match cancel.as_ref() {
-                Some(cancel) => tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        return Err(ToolError::NeverDispatched(format!(
-                            "cancelled {tool} while it was queued behind another call; the \
-                             worker and its database are unaffected"
-                        )));
-                    }
-                    guard = admission => guard?,
-                },
-                None => admission.await?,
-            }
-        };
-        if let Some(progress) = dispatch_progress {
-            progress.dispatched();
-        }
-        let timeout = timeout.saturating_sub(admitted.elapsed());
         let tracks_open = open_dispatch.is_some();
-        let mut previous_idb_path = None;
-        let peer = {
+        let admission = async {
+            let call_guard = self.slot.call_lock.lock().await;
             let mut child = self.slot.child.lock().await;
             match &child.state {
-                ChildState::Leased { session_id } if session_id == &self.session_id => {
-                    if let Some(open_dispatch) = open_dispatch.take() {
-                        previous_idb_path = child.idb_path.replace(open_dispatch.database_path);
-                        child.pending_open_artifacts = open_dispatch.artifacts;
-                    }
-                    child.peer.clone()
-                }
+                ChildState::Leased { session_id } if session_id == &self.session_id => {}
                 ChildState::Dead => {
                     return Err(ToolError::WorkerCrashed {
                         worker_id: self.worker_id,
@@ -962,12 +968,60 @@ impl PooledWorkerHandle {
                     )));
                 }
             }
+            // The child mutex, outbound queue, and call lock are all part of
+            // admission. In particular, an acquired call lock alone says
+            // nothing about whether the child can execute this request.
+            let request = remote::dispatch_tool(&child.peer, tool, args).await;
+            // No await may separate successful dispatch, artifact ownership,
+            // and arming retirement: another runtime thread may already be
+            // executing the request. A failed send means the transport is
+            // gone, so it also needs retirement.
+            let retire_guard = WorkerRetireGuard::call(self, tool);
+            let mut previous_idb_path = None;
+            if request.is_ok() {
+                if let Some(open_dispatch) = open_dispatch {
+                    previous_idb_path = child.idb_path.replace(open_dispatch.database_path);
+                    child.pending_open_artifacts = open_dispatch.artifacts;
+                }
+                if let Some(progress) = dispatch_progress {
+                    progress.dispatched();
+                }
+            }
+            Ok((call_guard, request, retire_guard, previous_idb_path))
         };
-
-        let request = remote::call_tool(&peer, tool, args);
-        tokio::pin!(request);
-        let mut retire_guard = WorkerRetireGuard::call(self, tool);
-
+        let admission = async {
+            tokio::time::timeout(timeout, admission)
+                .await
+                .map_err(|_| {
+                    ToolError::NeverDispatched(format!(
+                        "{tool} timed out after {} seconds waiting for the IDA worker, which is \
+                         still busy; the worker and its database are \
+                         unaffected, retry once that call finishes",
+                        timeout.as_secs()
+                    ))
+                })?
+        };
+        let (_call_guard, request, mut retire_guard, previous_idb_path) = match cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(ToolError::NeverDispatched(format!(
+                        "cancelled {tool} before dispatch to the IDA worker; the \
+                         worker and its database are unaffected"
+                    )));
+                }
+                admitted = admission => admitted?,
+            },
+            None => admission.await?,
+        };
+        let timeout = timeout.saturating_sub(admitted.elapsed());
+        let response = async {
+            match request {
+                Ok(request) => remote::tool_response(request, tool).await,
+                Err(error) => Err(error),
+            }
+        };
+        tokio::pin!(response);
         let result = if let Some(cancel) = cancel {
             tokio::select! {
                 biased;
@@ -981,10 +1035,10 @@ impl PooledWorkerHandle {
                         self.worker_id
                     )));
                 }
-                result = tokio::time::timeout(timeout, &mut request) => result,
+                result = tokio::time::timeout(timeout, &mut response) => result,
             }
         } else {
-            tokio::time::timeout(timeout, &mut request).await
+            tokio::time::timeout(timeout, &mut response).await
         };
 
         match result {
@@ -4272,25 +4326,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_reservation_counts_toward_pool_capacity() {
-        let pool = test_pool(1);
+    async fn spawn_reservation_delays_lease_without_exceeding_capacity() {
+        let mut pool = test_pool(1);
+        pool.startup_timeout = Duration::from_millis(25);
         let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
 
         assert_eq!(pool.live_or_reserved_count().await, 1);
         let err = match pool.lease("session-b").await {
-            Ok(_) => panic!("lease should fail while the only slot is reserved"),
+            Ok(_) => panic!("lease cannot use the only slot while it is reserved"),
             Err(err) => err,
         };
-        match err {
-            ToolError::PoolExhausted { active, max } => {
-                assert_eq!(active, 1);
-                assert_eq!(max, 1);
-            }
-            other => panic!("unexpected lease error: {other}"),
-        }
+        assert!(matches!(err, ToolError::NeverDispatched(_)));
+        assert_eq!(pool.live_or_reserved_count().await, 1);
 
         reservation.finish(None).await.expect("release reservation");
         assert_eq!(pool.live_or_reserved_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_wait_queue_is_bounded_and_dropped_waiters_release_capacity() {
+        let pool = test_pool(1);
+        let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
+        let mut waiters = (0..crate::ida::pool::POOL_ACQUIRE_CAPACITY)
+            .map(|_| Box::pin(pool.lease("waiting")))
+            .collect::<Vec<_>>();
+        for waiter in &mut waiters {
+            assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        }
+        assert!(matches!(pool.lease("excess").await, Err(ToolError::Busy)));
+        drop(waiters);
+        assert_eq!(
+            pool.acquisition_slots.available_permits(),
+            crate::ida::pool::POOL_ACQUIRE_CAPACITY
+        );
+        reservation.finish(None).await.expect("release reservation");
     }
 
     #[tokio::test]

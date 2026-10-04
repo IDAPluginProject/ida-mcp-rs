@@ -108,6 +108,65 @@ run_case() {
   echo "   ✓ $label: $sig saved the rename and exited within ${waited}s with stdin open"
 }
 
+# A closebase hook reproduces an IDA close that never finishes. Shutdown must
+# use its own short deadline even when the ordinary worker watchdog is 1800s.
+run_hung_close_case() {
+  local sig="$1" dir="$work/hung-close-$1" fifo log db code child_pid response waited
+  mkdir -p "$dir"
+  fifo="$dir/stdin.fifo"; log="$dir/out.log"; db="$dir/mini.i64"
+  cp "$IDB_PATH" "$db"
+  mkfifo "$fifo"
+  RUST_LOG=ida_mcp=info "$BIN" < "$fifo" > "$log" 2>&1 &
+  pid=$!
+  exec 3>"$fifo"
+  send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"shutdown-test","version":"0.1"},"capabilities":{}}}'
+  send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+  wait_response 1 "$log" 10 >/dev/null
+  send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
+  wait_response 2 "$log" 120 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL[hung-close-$sig]: open failed" >&2; exit 1; }
+  code="$(cat <<'PY'
+import ida_idp, ida_loader, os, time
+_shutdown_marker = ida_loader.get_path(ida_loader.PATH_TYPE_IDB) + '.close-entered'
+class _ShutdownHang(ida_idp.IDB_Hooks):
+    def closebase(self):
+        with open(_shutdown_marker, 'w') as marker:
+            marker.write('entered')
+        time.sleep(600)
+_shutdown_hang = _ShutdownHang()
+if not _shutdown_hang.hook():
+    raise RuntimeError('could not install closebase hook')
+os.getpid()
+PY
+)"
+  send "$(jq -cn --arg code "$code" '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"run_script",arguments:{code:$code}}}')"
+  response="$(wait_response 3 "$log" 30)"
+  echo "$response" | jq -e '.result.isError != true' >/dev/null || { echo "FAIL[hung-close-$sig]: hook failed" >&2; echo "$response" >&2; exit 1; }
+  child_pid="$(echo "$response" | jq -r '.result.content[0].text' | jq -r '.result')"
+  [[ "$child_pid" =~ ^[0-9]+$ ]] || { echo "FAIL[hung-close-$sig]: missing child PID" >&2; exit 1; }
+
+  if [[ "$sig" == EOF ]]; then exec 3>&-; else kill "-$sig" "$pid"; fi
+  waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1; waited=$((waited + 1))
+    if [[ $waited -ge 25 ]]; then
+      echo "FAIL[hung-close-$sig]: server still running after ${waited}s" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+  done
+  wait "$pid" || { echo "FAIL[hung-close-$sig]: server exited unsuccessfully" >&2; exit 1; }
+  pid=
+  exec 3>&-
+  [[ -f "$db.close-entered" ]] || { echo "FAIL[hung-close-$sig]: closebase was never entered" >&2; cat "$log" >&2; exit 1; }
+  grep -q 'IDA database close timed out during shutdown' "$log" || { echo "FAIL[hung-close-$sig]: shutdown deadline did not fire" >&2; cat "$log" >&2; exit 1; }
+  for _ in {1..5}; do
+    kill -0 "$child_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then echo "FAIL[hung-close-$sig]: child $child_pid survived shutdown" >&2; exit 1; fi
+  echo "   ✓ hung-close-$sig: entered closebase, retired child, exited within ${waited}s"
+}
+
 # A SIGKILL cannot be handled, so finished auto-analysis must already be on
 # disk: reopening the unpacked database after the kill shows every function.
 run_kill_case() {
@@ -158,6 +217,9 @@ run_case stdio-term TERM
 run_case stdio-hup HUP
 run_case workspace-term TERM --workspace
 run_case workspace-hup HUP --workspace
+run_hung_close_case TERM
+run_hung_close_case HUP
+run_hung_close_case EOF
 run_kill_case
 
 echo "✅ shutdown-signal test passed"

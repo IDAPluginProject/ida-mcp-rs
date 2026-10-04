@@ -1,8 +1,10 @@
 //! Helpers for calling a child `ida-mcp worker` over MCP stdio.
 
 use crate::error::{ToolError, DEBUGGER_START_RETAINED_PREFIX};
-use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
-use rmcp::service::{Peer, RoleClient};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, JsonObject, ServerResult,
+};
+use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient, ServiceError};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -194,9 +196,43 @@ pub(crate) async fn call_tool(
     tool: &'static str,
     args: JsonObject,
 ) -> Result<CallToolResult, ToolError> {
-    peer.call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+    let request = dispatch_tool(peer, tool, args).await?;
+    tool_response(request, tool).await
+}
+
+/// Commit one request to rmcp's outbound queue. With no progress-timeout
+/// options, rmcp's cancellable channel send is its last await before returning
+/// this handle. Dropping this future before it returns cannot send the request.
+pub(crate) async fn dispatch_tool(
+    peer: &Peer<RoleClient>,
+    tool: &'static str,
+    args: JsonObject,
+) -> Result<RequestHandle<RoleClient>, ToolError> {
+    peer.send_cancellable_request(
+        ClientRequest::CallToolRequest(CallToolRequest::new(
+            CallToolRequestParams::new(tool).with_arguments(args),
+        )),
+        PeerRequestOptions::no_options(),
+    )
+    .await
+    .map_err(|err| ToolError::RemoteProtocol(format!("{tool} call failed: {err}")))
+}
+
+pub(crate) async fn tool_response(
+    request: RequestHandle<RoleClient>,
+    tool: &'static str,
+) -> Result<CallToolResult, ToolError> {
+    match request
+        .await_response()
         .await
-        .map_err(|err| ToolError::RemoteProtocol(format!("{tool} call failed: {err}")))
+        .map_err(|err| ToolError::RemoteProtocol(format!("{tool} call failed: {err}")))?
+    {
+        ServerResult::CallToolResult(result) => Ok(result),
+        _ => Err(ToolError::RemoteProtocol(format!(
+            "{tool} call failed: {}",
+            ServiceError::UnexpectedResponse
+        ))),
+    }
 }
 
 #[cfg(test)]

@@ -369,8 +369,8 @@ the database path it wrote. Use it to checkpoint renames, comments, types, and
 patches; `close_idb` also saves. If the client exits without closing, the
 server attempts a graceful shutdown on stdin EOF and on SIGTERM, SIGINT,
 SIGQUIT, or SIGHUP, which closes and packs the open database; the log names
-the signal. That attempt is bounded (the process exits a few seconds after the
-signal even if a client never closes stdin), a SIGKILL skips it, and a caught
+the signal. Default stdio allows ten seconds for that close, then retires the
+child if needed. A SIGKILL skips graceful shutdown, and a caught
 SDK crash deliberately discards unsaved changes, so `save_idb` remains the
 only guarantee for edits. Finished auto-analysis is flushed to the database
 as soon as a raw open or `analyze_funcs` completes, because some MCP clients
@@ -388,7 +388,8 @@ binary in `worker` mode), as pooled HTTP (`--max-workers N`) and `--workspace`
 do. A call that overruns its `timeout_secs` (or the 1800 s operation watchdog,
 `--workspace-worker-op-timeout-secs`) kills that child and returns a timeout:
 the database is then no longer open, changes since the last `save_idb` are
-lost, and the next `open_idb` starts a fresh worker. This is what makes a
+lost, and the next `open_idb` gets a fresh worker. If its replacement is still
+starting, that open waits for startup, bounded to 30 seconds. This is what makes a
 native IDA call that never returns recoverable; nothing can interrupt it in
 place. Single-worker HTTP still hosts IDA in the server process and keeps
 running after a crash in a process whose native state may be damaged.

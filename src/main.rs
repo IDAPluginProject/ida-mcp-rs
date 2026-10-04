@@ -539,9 +539,18 @@ fn run_server(
         }
         info!("MCP server shutting down");
         let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
-        // Close through the child so IDA saves and packs before the pool
-        // stops it; a failure here only means there was nothing to close.
-        let _ = database.close().await;
+        // Give IDA a chance to save and pack, but never inherit the normal
+        // long-running operation budget during process shutdown. Keep the
+        // close future alive until the pool has finished retiring its child;
+        // dropping it early would hand cleanup to a detached retirement guard.
+        let close = database.close();
+        tokio::pin!(close);
+        if tokio::time::timeout(Duration::from_secs(10), &mut close)
+            .await
+            .is_err()
+        {
+            warn!("IDA database close timed out during shutdown; retiring the child");
+        }
         pool.shutdown_all().await;
         info!("Server stopped");
         Ok::<_, anyhow::Error>(())
