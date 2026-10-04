@@ -40,6 +40,9 @@ wait_response() {
 
 text() { jq -r '.result.content[0].text // empty'; }
 
+# Piped match checks must consume all input: grep -q can give the producer
+# SIGPIPE after a match, turning success into a failure under pipefail.
+
 child_pids() {
   # Every child the router reported spawning, in order.
   sed 's/\x1b\[[0-9;]*m//g' "$1" | sed -n 's/.*spawned IDA child worker.*pid=Some(\([0-9]*\)).*/\1/p'
@@ -80,7 +83,7 @@ send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_script
 # reports what it knows).
 sleep 2
 send '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
-wait_response 50 "$dir/out.log" 10 | text | grep -q '"executing"' || { echo "FAIL: recent_operations does not show the stuck script as executing" >&2; exit 1; }
+wait_response 50 "$dir/out.log" 10 | text | grep '"executing"' >/dev/null || { echo "FAIL: recent_operations does not show the stuck script as executing" >&2; exit 1; }
 stuck_resp="$(wait_response 5 "$dir/out.log" 60)" || { echo "FAIL: the stuck call never returned" >&2; exit 1; }
 elapsed=$(( $(date +%s) - started ))
 echo "$stuck_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: stuck call did not return an error" >&2; echo "$stuck_resp" >&2; exit 1; }
@@ -98,7 +101,7 @@ if kill -0 "$first_child" 2>/dev/null; then echo "FAIL: stuck child $first_child
 echo "   ✓ child $first_child is gone"
 
 send '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
-wait_response 6 "$dir/out.log" 30 | text | grep -q 'No database is currently open' || { echo "FAIL: a database was still bound after the stuck child was killed" >&2; exit 1; }
+wait_response 6 "$dir/out.log" 30 | text | grep 'No database is currently open' >/dev/null || { echo "FAIL: a database was still bound after the stuck child was killed" >&2; exit 1; }
 echo "   ✓ no database bound after retirement"
 
 send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:7,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
@@ -118,10 +121,10 @@ started=$(date +%s)
 send '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":1}}}'
 queued_resp="$(wait_response 61 "$dir/out.log" 40)" || { echo "FAIL: the queued call never returned" >&2; exit 1; }
 elapsed=$(( $(date +%s) - started ))
-echo "$queued_resp" | text | grep -q 'waiting for the IDA worker' || { echo "FAIL: queued call did not report a queue timeout" >&2; echo "$queued_resp" >&2; exit 1; }
+echo "$queued_resp" | text | grep 'waiting for the IDA worker' >/dev/null || { echo "FAIL: queued call did not report a queue timeout" >&2; echo "$queued_resp" >&2; exit 1; }
 [[ $elapsed -le 20 ]] || { echo "FAIL: queued call took ${elapsed}s" >&2; exit 1; }
 send '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"recent_operations","arguments":{}}}'
-wait_response 63 "$dir/out.log" 10 | text | grep -q '"queued"' || { echo "FAIL: the queued call was not recorded as queued" >&2; exit 1; }
+wait_response 63 "$dir/out.log" 10 | text | grep '"queued"' >/dev/null || { echo "FAIL: the queued call was not recorded as queued" >&2; exit 1; }
 # Cancelling a queued read and a queued open likewise end only the wait.
 send '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":30}}}'
 send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:66,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
@@ -130,7 +133,7 @@ send '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"recent_op
 wait_response 64 "$dir/out.log" 10 | text | jq -e '.active_operation.tool == "open_idb" and .active_operation.status == "queued"' >/dev/null || { echo "FAIL: the cancellation target did not enter the worker queue" >&2; exit 1; }
 # Neither request may have finished (for example, with Busy) before we
 # cancel it. The healthy script still owns the only worker's call lock.
-if grep -E '"id":(65|66)[,}]' "$dir/out.log" | grep -q '"jsonrpc"'; then
+if grep -E '"id":(65|66)[,}]' "$dir/out.log" | grep '"jsonrpc"' >/dev/null; then
   echo "FAIL: a cancellation target finished before it could be cancelled" >&2
   exit 1
 fi
@@ -176,13 +179,13 @@ send '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search","
 read_resp="$(wait_response 11 "$dir/out.log" 60)" || { echo "FAIL: the stuck read tool never returned" >&2; exit 1; }
 elapsed=$(( $(date +%s) - started ))
 echo "$read_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: stuck read tool did not return a top-level error" >&2; echo "$read_resp" >&2; exit 1; }
-echo "$read_resp" | text | grep -q 'killed worker' || { echo "FAIL: stuck read tool error does not report the retirement" >&2; echo "$read_resp" >&2; exit 1; }
+echo "$read_resp" | text | grep 'killed worker' >/dev/null || { echo "FAIL: stuck read tool error does not report the retirement" >&2; echo "$read_resp" >&2; exit 1; }
 [[ $elapsed -le 30 ]] || { echo "FAIL: stuck read tool took ${elapsed}s to return" >&2; exit 1; }
 for _ in $(seq 1 10); do kill -0 "$stuck_child" 2>/dev/null || break; sleep 1; done
 if kill -0 "$stuck_child" 2>/dev/null; then echo "FAIL: child $stuck_child stuck in a read tool is still running" >&2; exit 1; fi
 echo "   ✓ stuck read tool returned the retirement error after ${elapsed}s and child $stuck_child is gone"
 send '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1,"timeout_secs":5}}}'
-wait_response 12 "$dir/out.log" 30 | text | grep -q 'No database is currently open' || { echo "FAIL: a later read tool did not report the database as closed" >&2; exit 1; }
+wait_response 12 "$dir/out.log" 30 | text | grep 'No database is currently open' >/dev/null || { echo "FAIL: a later read tool did not report the database as closed" >&2; exit 1; }
 echo "   ✓ later calls answer immediately with no database open"
 
 # A worker that dies mid-call is a fatal, top-level error even from a batch
@@ -194,7 +197,7 @@ wait_response 71 "$dir/out.log" 30 | jq -e '.result.isError != true' >/dev/null 
 send '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"search","arguments":{"targets":["ret"],"kind":"text","limit":5,"timeout_secs":10}}}'
 dead_resp="$(wait_response 72 "$dir/out.log" 40)" || { echo "FAIL: search on a dying worker never returned" >&2; exit 1; }
 echo "$dead_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: a worker dying inside search returned success" >&2; echo "$dead_resp" >&2; exit 1; }
-echo "$dead_resp" | text | grep -q 'crashed or disconnected' || { echo "FAIL: worker loss inside search was not reported as such" >&2; echo "$dead_resp" >&2; exit 1; }
+echo "$dead_resp" | text | grep 'crashed or disconnected' >/dev/null || { echo "FAIL: worker loss inside search was not reported as such" >&2; echo "$dead_resp" >&2; exit 1; }
 echo "   ✓ worker death inside a batch tool is the call's error"
 exec 3>&-
 wait "$pid" 2>/dev/null || true
@@ -237,7 +240,7 @@ wait_response 1 "$dir/out.log" 10 >/dev/null
 cp "$IDB_PATH" "$db"
 send "$(jq -cn --arg p "$db" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
 wait_response 2 "$dir/out.log" 120 >/dev/null
-sed 's/\x1b\[[0-9;]*m//g' "$dir/out.log" | grep -q 'ida_mcp::ida::loop_impl.*Database opened' || {
+sed 's/\x1b\[[0-9;]*m//g' "$dir/out.log" | grep 'ida_mcp::ida::loop_impl.*Database opened' >/dev/null || {
   echo "FAIL: a target-scoped RUST_LOG did not show the child's loop_impl log" >&2; exit 1; }
 exec 3>&-
 wait "$pid" 2>/dev/null || true
@@ -263,7 +266,7 @@ wait_response 2 "$dir/out.log" 120 | jq -e '.result.isError != true' >/dev/null 
 send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import os\nfor _ in range(256):\n    os.write(2, b\"F\" * 4095 + b\"\\n\")\n42","timeout_secs":2}}}'
 stderr_resp="$(wait_response 3 "$dir/out.log" 30)" || { echo "FAIL: unread stderr stopped the watchdog" >&2; exit 1; }
 echo "$stderr_resp" | jq -e '.result.isError == true' >/dev/null || { echo "FAIL: native stderr did not fill the pipe" >&2; exit 1; }
-echo "$stderr_resp" | text | grep -q 'killed worker' || { echo "FAIL: stderr probe did not report retirement" >&2; exit 1; }
+echo "$stderr_resp" | text | grep 'killed worker' >/dev/null || { echo "FAIL: stderr probe did not report retirement" >&2; exit 1; }
 exec 4>&-
 exec 3>&-
 for _ in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
