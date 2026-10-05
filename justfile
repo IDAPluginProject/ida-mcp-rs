@@ -260,6 +260,10 @@ test-license: build
 test-stuck-call: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-stuck-call
 
+# Verify shared HTTP child retirement and ownership on both MCP lifecycles.
+test-http-stuck-call: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-http-stuck-call
+
 # Verify a shutdown signal saves the database and exits with stdin still open (debug)
 test-shutdown-signal: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-shutdown-signal

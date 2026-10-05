@@ -1,7 +1,11 @@
 //! Subprocess tests for the supervisor; these fake workers do not load IDA.
 
 use crate::error::ToolError;
-use crate::ida::pool::{ChildState, DispatchProgress, OpenDispatch, WorkerPool, WorkerPoolConfig};
+use crate::ida::pool::{
+    ChildState, DispatchProgress, OpenDispatch, WorkerPool, WorkerPoolConfig, WorkspaceDatabase,
+};
+use crate::ida::types::ConditionalCloseResult;
+use crate::ida::worker::CloseAuthorization;
 use rmcp::model::JsonObject;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,6 +41,7 @@ while IFS= read -r request; do
         *'"method":"tools/call"'*)
             printf '%s\n' "$request" >> "$1/requests"
             case "$request" in *'"name":"stall"'*) continue;; esac
+            case "$request" in *'"name":"delay"'*) while [ ! -e "$1/release-call" ]; do sleep 0.05; done;; esac
             id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
             printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"isError":false}}\n' "$id"
             ;;
@@ -98,6 +103,113 @@ async fn assert_process_exited(pid: i32) {
     })
     .await
     .expect("worker process exited and was reaped");
+}
+
+#[tokio::test]
+async fn implicit_close_ownership_cannot_outlive_its_database_generation() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let database = WorkspaceDatabase::new_shared_http(pool.clone());
+    let (_, first, _) = database.lease_for_open().await.expect("first lease");
+    let original = database
+        .issue_close_token("owner-a", first)
+        .await
+        .expect("current generation")
+        .expect("first owner");
+    let denied = database.close_authorized("other", None, false).await;
+    let Ok(CloseAuthorization::Denied { .. }) = denied else {
+        panic!("non-owner close must be denied: {denied:?}");
+    };
+    database
+        .close_if_generation(first)
+        .await
+        .expect("close first");
+    let (_, second, _) = database.lease_for_open().await.expect("second lease");
+    let replacement = database
+        .issue_close_token("owner-b", second)
+        .await
+        .expect("current generation")
+        .expect("replacement owner");
+    assert_ne!(original.token, replacement.token);
+    assert!(database.issue_close_token("owner-a", first).await.is_none());
+    assert_eq!(
+        database
+            .close_if_generation(first)
+            .await
+            .expect("stale cleanup"),
+        ConditionalCloseResult::NotCurrent
+    );
+    let stale = database
+        .close_authorized("owner-a", Some(&original.token), false)
+        .await;
+    let Ok(CloseAuthorization::Denied { .. }) = stale else {
+        panic!("stale token must be denied: {stale:?}");
+    };
+    let current = database.close_authorized("owner-b", None, false).await;
+    let Ok(CloseAuthorization::Granted) = current else {
+        panic!("current owner must close: {current:?}");
+    };
+    pool.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn stale_handle_cannot_reach_a_replacement_database_in_the_same_worker() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let database = WorkspaceDatabase::new_shared_http(pool.clone());
+    let (original, first, _) = database.lease_for_open().await.expect("first lease");
+    database
+        .close_if_generation(first)
+        .await
+        .expect("close first");
+    let (replacement, second, _) = database.lease_for_open().await.expect("replacement lease");
+    assert_eq!(original.worker_id, replacement.worker_id);
+    let requests = std::fs::read_to_string(fixture.directory.join("requests"))
+        .expect("first close reached the worker");
+
+    let result = original
+        .call_tool(
+            "stale_call",
+            JsonObject::new(),
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+        )
+        .await;
+    let Err(ToolError::DatabaseReplaced) = result else {
+        panic!("stale lease must report replacement: {result:?}");
+    };
+    pool.release(original.clone()).await.expect("stale release");
+    pool.mark_dead_for_lease(&original.slot, original.lease_id)
+        .await;
+    database
+        .clear_handle_if_lease(original.worker_id, first)
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.directory.join("requests")).expect("worker requests"),
+        requests,
+        "stale work must not send an RPC to the replacement"
+    );
+    database
+        .required_handle_for_generation(Some(second))
+        .await
+        .expect("replacement binding survives stale cleanup");
+    replacement
+        .call_tool(
+            "replacement_call",
+            JsonObject::new(),
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("replacement remains usable");
+    database.close().await.expect("close replacement");
+    pool.shutdown_all().await;
 }
 
 #[tokio::test]
@@ -375,5 +487,149 @@ async fn cancellation_after_dispatch_retires_the_worker() {
         .expect("call task succeeds");
     assert!(matches!(result, Err(ToolError::WorkerRetired(_))));
     assert_process_exited(pid).await;
+    pool.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn shared_call_survives_cancelled_and_dropped_waiters() {
+    for drop_waiter in [false, true] {
+        let fixture = Fixture::new();
+        fixture.ready();
+        let pool = fixture.pool(Duration::from_secs(3));
+        let database = WorkspaceDatabase::new_shared_http(pool.clone());
+        let (handle, _, _) = database.lease_for_open().await.expect("shared lease");
+        let pid = fixture.pid().await;
+        let cancel = CancellationToken::new();
+        let call_cancel = cancel.clone();
+        let caller = handle.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call_tool(
+                    "delay",
+                    JsonObject::new(),
+                    Duration::from_secs(3),
+                    Some(call_cancel),
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.directory.join("requests").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child received the request");
+        cancel.cancel();
+        if drop_waiter {
+            call.abort();
+            assert!(call.await.expect_err("waiter was aborted").is_cancelled());
+        } else {
+            assert!(
+                !call.is_finished(),
+                "background cancellation waits for settlement"
+            );
+            std::fs::write(fixture.directory.join("release-call"), b"")
+                .expect("finish native call");
+            call.await
+                .expect("waiter joined")
+                .expect("native result survived cancellation");
+        }
+        std::fs::write(fixture.directory.join("release-call"), b"").expect("finish native call");
+        handle
+            .call_tool(
+                "probe",
+                JsonObject::new(),
+                Duration::from_secs(2),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the shared worker survived");
+        assert_eq!(fixture.pid().await, pid);
+        pool.shutdown_all().await;
+        assert_process_exited(pid).await;
+    }
+}
+
+#[tokio::test]
+async fn abandoned_shared_call_keeps_its_watchdog_and_can_reopen() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let database = WorkspaceDatabase::new_shared_http(pool.clone());
+    let (handle, generation, _) = database.lease_for_open().await.expect("shared lease");
+    let pid = fixture.pid().await;
+    let call = tokio::spawn(async move {
+        handle
+            .call_tool(
+                "stall",
+                JsonObject::new(),
+                Duration::from_millis(250),
+                None,
+                None,
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !fixture.directory.join("requests").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child received the request");
+    call.abort();
+    assert!(call.await.expect_err("waiter was aborted").is_cancelled());
+    assert_process_exited(pid).await;
+    let (_, replacement, fresh) = database
+        .lease_for_open()
+        .await
+        .expect("reopen after watchdog");
+    assert!(fresh);
+    assert_ne!(generation, replacement);
+    pool.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn shutdown_rejects_queued_calls_without_unbinding_the_database() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let database = std::sync::Arc::new(WorkspaceDatabase::new_shared_http(pool.clone()));
+    let (handle, generation, _) = database.lease_for_open().await.expect("shared lease");
+    let busy = handle.slot.call_lock.lock().await;
+    let caller = database.clone();
+    let call = tokio::spawn(async move {
+        caller
+            .call_result_for_generation(
+                "probe",
+                serde_json::json!({}),
+                None,
+                None,
+                Some(generation),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.slot.queued.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("request queued");
+    pool.begin_shutdown().await;
+    let result = call.await.expect("queued call joined");
+    let Err(ToolError::NeverDispatched(_)) = result else {
+        panic!("shutdown must reject undispatched work: {result:?}");
+    };
+    database
+        .required_handle_for_generation(Some(generation))
+        .await
+        .expect("database remains available for saving");
+    drop(busy);
+    database.close().await.expect("save during shutdown");
     pool.shutdown_all().await;
 }

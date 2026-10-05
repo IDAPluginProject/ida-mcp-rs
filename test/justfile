@@ -615,6 +615,10 @@ measure-tools:
         FAIL_OVER_CHARS="${FAIL_OVER_CHARS:-0}" \
         bash ./measure_tools.sh
 
+# Shared HTTP cancellation and stuck-call recovery (#58)
+test-http-stuck-call: test-bootstrap
+    python3 ./http_stuck_call.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+
 # A call stuck inside IDA must time out, retire the child, and reopen on a fresh one (#58)
 test-stuck-call: test-bootstrap
     #!/usr/bin/env bash
@@ -638,6 +642,7 @@ test-shutdown-signal: test-bootstrap
         exit 1
     fi
     echo "🧪 Running shutdown-signal test..."
+    python3 ./shutdown_preserves.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
     MCP_STDIO_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" RAW_PATH="{{ test_bin }}" RUST_LOG="{{ rust_log }}" \
         bash ./stdio_shutdown_signal.sh
     echo "✅ Shutdown-signal test passed"

@@ -104,7 +104,7 @@ Options (workspace flags are global):
   0 disables). In pooled mode this is the fallback reclaim for POST-only
   clients — SSE clients are reclaimed faster via `--worker-disconnect-grace-secs`.
 - `--max-workers`: maximum child worker processes for concurrent multi-IDB
-  sessions; `1` keeps the legacy in-process worker
+  sessions; `1` shares one supervised child and disables idle reaping
 - `--min-workers`: idle child workers to keep warm when pooled mode is enabled
 - `--worker-idle-timeout-secs`: seconds before an idle pooled worker process is
   reaped (default 300s; 0 disables)
@@ -161,8 +161,13 @@ Runtime tools such as `tool_catalog` do not accept a database ID.
 ## Concurrency model
 
 IDA requires main-thread access, and one IDA process can own only one active
-database at a time. The default stdio mode serializes calls through one child
-worker; single-worker HTTP serializes them through one in-process worker loop.
+database at a time. Default stdio and single-worker HTTP serialize calls through
+one supervised child worker. HTTP clients share its database and close-token
+ownership; a retired child loses that binding and the next open creates a new one.
+Cancelling a shared HTTP request leaves any dispatched call running under its
+watchdog. Graceful shutdown allows up to 120 seconds for the active call to
+settle and the database to save before it cancels background tasks or retires
+the child.
 
 With `--workspace`, each open database owns a child-worker lease addressed by
 its `database_id`. Calls to different handles can run concurrently up to

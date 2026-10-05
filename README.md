@@ -388,8 +388,9 @@ the database path it wrote. Use it to checkpoint renames, comments, types, and
 patches; `close_idb` also saves. If the client exits without closing, the
 server attempts a graceful shutdown on stdin EOF and on SIGTERM, SIGINT,
 SIGQUIT, or SIGHUP, which closes and packs the open database; the log names
-the signal. Default stdio allows ten seconds for that close, then retires the
-child if needed. A SIGKILL skips graceful shutdown, and a caught
+the signal. Default stdio and HTTP allow up to 120 seconds for the active
+operation to settle and the database to save before retiring the child. A SIGKILL
+skips graceful shutdown, and a caught
 SDK crash deliberately discards unsaved changes, so `save_idb` remains the
 only guarantee for edits. Finished auto-analysis is flushed to the database
 as soon as a raw open or `analyze_funcs` completes, because some MCP clients
@@ -400,19 +401,21 @@ If a call crashes inside the IDA SDK (SIGSEGV/SIGBUS), ida-mcp returns an error
 for that call (a top-level error even from batch tools that normally report
 per-item failures) and then stops using that database state: the database is closed
 without saving, so changes since the last `save_idb` are lost, and the child
-worker is replaced (default stdio, pooled HTTP, and `--workspace`). Call
+worker is replaced (stdio, HTTP, and `--workspace`). Call
 `open_idb` again to continue.
 
-The default stdio server runs IDA in one supervised child process (the same
+The default stdio and HTTP servers run IDA in one supervised child process (the same
 binary in `worker` mode), as pooled HTTP (`--max-workers N`) and `--workspace`
 do. A call that overruns its `timeout_secs` (or the 1800 s operation watchdog,
-`--workspace-worker-op-timeout-secs`) kills that child and returns a timeout:
+`--workspace-worker-op-timeout-secs` for stdio, `--worker-op-timeout-secs` for
+HTTP) kills that child and returns a timeout:
 the database is then no longer open, changes since the last `save_idb` are
 lost, and the next `open_idb` gets a fresh worker. If its replacement is still
 starting, that open waits for startup, bounded to 30 seconds. This is what makes a
 native IDA call that never returns recoverable; nothing can interrupt it in
-place. Single-worker HTTP still hosts IDA in the server process and keeps
-running after a crash in a process whose native state may be damaged.
+place. On shared HTTP, cancelling a request or disconnecting stops that
+client's wait; an already dispatched call continues under its watchdog so
+other clients keep their database and unsaved edits.
 
 ### Removed tools
 
@@ -450,7 +453,7 @@ appears when the server runs with `--workspace`.
 
 ### HTTP/SSE worker pool
 
-`serve-http` runs one in-process IDA worker by default. To serve several
+`serve-http` shares one supervised IDA child by default. To serve several
 stateful HTTP/SSE clients at once, set `--max-workers` above `1`. Each session
 then gets its own child `ida-mcp worker` process:
 

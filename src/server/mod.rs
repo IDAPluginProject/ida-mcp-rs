@@ -103,6 +103,10 @@ impl ServerRuntimeState {
         Self::default()
     }
 
+    pub fn task_registry(&self) -> &task::TaskRegistry {
+        &self.task_registry
+    }
+
     /// Runtime state for an HTTP transport started with `--stateless` (see
     /// [`Self::stateless_http`]).
     pub fn new_stateless_http() -> Self {
@@ -1085,15 +1089,24 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        close_hint_for(self.mode, self.worker.is_pooled(), self.workspace_enabled())
+        close_hint_for(
+            self.mode,
+            self.worker.is_legacy_pooled(),
+            self.workspace_enabled(),
+        )
     }
 
-    fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
+    async fn http_close_grant(
+        &self,
+        generation: Option<DatabaseGeneration>,
+    ) -> Option<Result<CloseTokenGrant, String>> {
         if !self.workspace_enabled()
             && matches!(self.mode, ServerMode::Http)
             && self.worker.uses_close_tokens()
         {
-            self.worker.issue_close_token_for_session(&self.session_id)
+            self.worker
+                .issue_close_token_for_session(&self.session_id, generation)
+                .await
         } else {
             None
         }
@@ -1920,7 +1933,7 @@ impl IdaMcpServer {
         };
         let next_steps = dsc_analysis_next_steps(analysis_ready, next_step_hint);
 
-        let close_token = self.http_close_grant();
+        let close_token = self.http_close_grant(generation).await;
 
         let mut value = match serde_json::to_value(&db_info) {
             Ok(v) => v,
@@ -2410,7 +2423,9 @@ impl IdaMcpServer {
 
         let close_token = match (mode, owner_session_id.as_deref()) {
             (ServerMode::Http, Some(owner_session_id)) => {
-                worker.issue_close_token_for_session(owner_session_id)
+                worker
+                    .issue_close_token_for_session(owner_session_id, Some(database_generation))
+                    .await
             }
             _ => None,
         };
@@ -2438,7 +2453,11 @@ impl IdaMcpServer {
             apply_close_metadata(
                 map,
                 close_token,
-                close_hint_for(mode, worker.is_pooled(), workspace_database_id.is_some()),
+                close_hint_for(
+                    mode,
+                    worker.is_legacy_pooled(),
+                    workspace_database_id.is_some(),
+                ),
             );
         }
 
@@ -3048,7 +3067,7 @@ impl IdaMcpServer {
                 foreground_timeout_secs,
                 300,
                 |progress_tx, cancel| {
-                    self.worker.open_observed(
+                    self.worker.open_observed_with_generation(
                         &path,
                         req.load_debug_info.unwrap_or(false),
                         debug_info_path.clone(),
@@ -3067,8 +3086,9 @@ impl IdaMcpServer {
             )
             .await
         {
-            Ok(info) => {
-                let close_token = self.http_close_grant();
+            Ok(opened) => {
+                let close_token = self.http_close_grant(Some(opened.generation)).await;
+                let info = opened.info;
                 let analysis_task = if route_to_background && !info.analysis_status.auto_is_ok {
                     let cancel_token = self.background_lifetime(&ctx.meta).child_token();
                     let owner = self.task_owner(&ctx.meta);
@@ -3909,25 +3929,30 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if !self.workspace_enabled()
+        let result = if !self.workspace_enabled()
             && matches!(self.mode, ServerMode::Http)
             && self.worker.uses_close_tokens()
         {
-            match self.worker.authorize_close(
-                &self.session_id,
-                req.token.as_deref(),
-                req.force.unwrap_or(false),
-            ) {
-                CloseAuthorization::Granted => {}
-                CloseAuthorization::GrantedByOverride {
+            match self
+                .worker
+                .close_authorized(
+                    &self.session_id,
+                    req.token.as_deref(),
+                    req.force.unwrap_or(false),
+                )
+                .await
+            {
+                Ok(CloseAuthorization::Granted) => Ok(()),
+                Ok(CloseAuthorization::GrantedByOverride {
                     previous_owner_session_id,
-                } => {
+                }) => {
                     info!(
                         previous_owner_session_id = ?previous_owner_session_id,
                         "close_idb overriding previous HTTP owner session"
                     );
+                    Ok(())
                 }
-                CloseAuthorization::Denied { owner_session_id } => {
+                Ok(CloseAuthorization::Denied { owner_session_id }) => {
                     info!(owner_session_id = ?owner_session_id, "close_idb ignored: owner token required");
                     return Ok(CallToolResult::success(vec![Content::text(
                         serde_json::to_string_pretty(&json!({
@@ -3939,9 +3964,11 @@ impl IdaMcpServer {
                         .unwrap_or_else(|_| "close_idb ignored: owner token required".to_string()),
                     )]));
                 }
+                Err(error) => Err(error),
             }
-        }
-        let result = self.worker.close().await;
+        } else {
+            self.worker.close().await
+        };
         if workspace_close_should_remove_entry(
             &result,
             &self.task_registry,
@@ -3954,7 +3981,6 @@ impl IdaMcpServer {
         }
         match result {
             Ok(()) => {
-                self.worker.clear_close_token();
                 info!("Tool call: close_idb completed successfully");
                 Ok(CallToolResult::success(vec![Content::text(
                     "Database closed",

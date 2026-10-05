@@ -108,15 +108,17 @@ run_case() {
   echo "   ✓ $label: $sig saved the rename and exited within ${waited}s with stdin open"
 }
 
-# A closebase hook reproduces an IDA close that never finishes. Shutdown must
-# use its own short deadline even when the ordinary worker watchdog is 1800s.
+# A closebase hook reproduces an IDA close that never finishes. The default
+# watchdog must not extend the 120-second shutdown budget; shorter operation
+# watchdogs can still end the close earlier.
 run_hung_close_case() {
-  local sig="$1" dir="$work/hung-close-$1" fifo log db code child_pid response waited
+  local sig="$1" max_wait="$2" dir="$work/hung-close-$1" fifo log db code child_pid response waited
+  shift 2
   mkdir -p "$dir"
   fifo="$dir/stdin.fifo"; log="$dir/out.log"; db="$dir/mini.i64"
   cp "$IDB_PATH" "$db"
   mkfifo "$fifo"
-  RUST_LOG=ida_mcp=info "$BIN" < "$fifo" > "$log" 2>&1 &
+  RUST_LOG=ida_mcp=info "$BIN" "$@" < "$fifo" > "$log" 2>&1 &
   pid=$!
   exec 3>"$fifo"
   send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"shutdown-test","version":"0.1"},"capabilities":{}}}'
@@ -148,7 +150,7 @@ PY
   waited=0
   while kill -0 "$pid" 2>/dev/null; do
     sleep 1; waited=$((waited + 1))
-    if [[ $waited -ge 25 ]]; then
+    if [[ $waited -ge $max_wait ]]; then
       echo "FAIL[hung-close-$sig]: server still running after ${waited}s" >&2
       cat "$log" >&2
       exit 1
@@ -158,7 +160,7 @@ PY
   pid=
   exec 3>&-
   [[ -f "$db.close-entered" ]] || { echo "FAIL[hung-close-$sig]: closebase was never entered" >&2; cat "$log" >&2; exit 1; }
-  grep -q 'IDA database close timed out during shutdown' "$log" || { echo "FAIL[hung-close-$sig]: shutdown deadline did not fire" >&2; cat "$log" >&2; exit 1; }
+  grep -Eq 'IDA database close (timed out|failed) during shutdown' "$log" || { echo "FAIL[hung-close-$sig]: shutdown deadline did not fire" >&2; cat "$log" >&2; exit 1; }
   for _ in {1..5}; do
     kill -0 "$child_pid" 2>/dev/null || break
     sleep 1
@@ -217,9 +219,9 @@ run_case stdio-term TERM
 run_case stdio-hup HUP
 run_case workspace-term TERM --workspace
 run_case workspace-hup HUP --workspace
-run_hung_close_case TERM
-run_hung_close_case HUP
-run_hung_close_case EOF
+run_hung_close_case TERM 140
+run_hung_close_case HUP 35 --workspace-worker-op-timeout-secs 2
+run_hung_close_case EOF 35 --workspace-worker-op-timeout-secs 2
 run_kill_case
 
 echo "✅ shutdown-signal test passed"

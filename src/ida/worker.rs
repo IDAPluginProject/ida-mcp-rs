@@ -53,7 +53,7 @@ pub(crate) enum CloseAuthorization {
 
 /// Internal state for close token ownership.
 #[derive(Debug, Default)]
-struct CloseTokenState {
+pub(crate) struct CloseTokenState {
     token: Mutex<Option<CloseTokenLease>>,
 }
 
@@ -69,7 +69,7 @@ impl CloseTokenState {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
-    fn issue_for_session(&self, session_id: &str) -> Result<CloseTokenGrant, String> {
+    pub(crate) fn issue_for_session(&self, session_id: &str) -> Result<CloseTokenGrant, String> {
         let mut guard = self.lock_token();
         if let Some(lease) = guard.as_ref() {
             if lease.owner_session_id == session_id {
@@ -95,7 +95,7 @@ impl CloseTokenState {
         })
     }
 
-    fn authorize_close(
+    pub(crate) fn authorize_close(
         &self,
         session_id: &str,
         token: Option<&str>,
@@ -118,18 +118,12 @@ impl CloseTokenState {
             }
         }
     }
-
-    fn clear(&self) {
-        let mut guard = self.lock_token();
-        *guard = None;
-    }
 }
 
 /// Handle for sending requests to the main thread IDA worker
 #[derive(Clone)]
 pub struct IdaWorker {
     tx: mpsc::SyncSender<IdaRequest>,
-    close_token: Arc<CloseTokenState>,
     /// A child under a supervising parent applies no deadline of its own:
     /// answering early would leave its IDA thread stuck while the parent
     /// keeps the worker, so the parent's watchdog is the only bound.
@@ -155,7 +149,6 @@ impl IdaWorker {
     pub fn new(tx: mpsc::SyncSender<IdaRequest>) -> Self {
         Self {
             tx,
-            close_token: Arc::new(CloseTokenState::default()),
             supervised: false,
         }
     }
@@ -171,26 +164,6 @@ impl IdaWorker {
     /// Deadline a child under supervision applies to its own requests: none
     /// in practice, so the parent's kill is what ends a stuck native call.
     const SUPERVISED_TIMEOUT_SECS: u64 = 60 * 60 * 24 * 365;
-
-    pub(crate) fn issue_close_token_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<CloseTokenGrant, String> {
-        self.close_token.issue_for_session(session_id)
-    }
-
-    pub(crate) fn authorize_close(
-        &self,
-        session_id: &str,
-        token: Option<&str>,
-        force: bool,
-    ) -> CloseAuthorization {
-        self.close_token.authorize_close(session_id, token, force)
-    }
-
-    pub(crate) fn clear_close_token(&self) {
-        self.close_token.clear();
-    }
 
     fn try_send(&self, req: IdaRequest) -> Result<(), ToolError> {
         match self.tx.try_send(req) {
@@ -364,11 +337,7 @@ impl IdaWorker {
             Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
         )
         .await?;
-        let result = rx.await.map_err(|_| ToolError::WorkerClosed)??;
-        if result == ConditionalCloseResult::Closed {
-            self.clear_close_token();
-        }
-        Ok(result)
+        rx.await.map_err(|_| ToolError::WorkerClosed)?
     }
 
     /// Close the currently open database.
@@ -1586,7 +1555,10 @@ impl WorkerBackend {
     }
 
     pub(crate) fn uses_close_tokens(&self) -> bool {
-        matches!(self, Self::Local(_))
+        match self {
+            Self::Local(_) => false,
+            Self::Pooled(state) => state.uses_close_tokens(),
+        }
     }
 
     pub(crate) fn is_pooled(&self) -> bool {
@@ -1597,12 +1569,16 @@ impl WorkerBackend {
         matches!(self, Self::Pooled(PooledDatabaseBinding::Legacy(_)))
     }
 
-    pub(crate) fn issue_close_token_for_session(
+    pub(crate) async fn issue_close_token_for_session(
         &self,
         session_id: &str,
+        generation: Option<DatabaseGeneration>,
     ) -> Option<Result<CloseTokenGrant, String>> {
         match self {
-            Self::Local(worker) => Some(worker.issue_close_token_for_session(session_id)),
+            Self::Local(_) => None,
+            Self::Pooled(database) if database.uses_close_tokens() => {
+                database.issue_close_token(session_id, generation?).await
+            }
             Self::Pooled(_) => None,
         }
     }
@@ -1619,24 +1595,18 @@ impl WorkerBackend {
         }
     }
 
-    pub(crate) fn authorize_close(
+    pub(crate) async fn close_authorized(
         &self,
         session_id: &str,
         token: Option<&str>,
         force: bool,
-    ) -> CloseAuthorization {
+    ) -> Result<CloseAuthorization, ToolError> {
         match self {
-            Self::Local(worker) => worker.authorize_close(session_id, token, force),
-            // Pooled HTTP workers are private to one rmcp session, so close_idb
-            // cannot affect another client's database and does not need a
-            // cross-session recovery token.
-            Self::Pooled(_) => CloseAuthorization::Granted,
-        }
-    }
-
-    pub(crate) fn clear_close_token(&self) {
-        if let Self::Local(worker) = self {
-            worker.clear_close_token();
+            Self::Local(worker) => {
+                worker.close().await?;
+                Ok(CloseAuthorization::Granted)
+            }
+            Self::Pooled(database) => database.close_authorized(session_id, token, force).await,
         }
     }
 
@@ -2796,7 +2766,7 @@ mod tests {
 
     use crate::error::ToolError;
     use crate::ida::request::{IdaRequest, SideEffectAdmission};
-    use crate::ida::worker::{CloseAuthorization, IdaWorker, WorkerBackend};
+    use crate::ida::worker::{CloseAuthorization, CloseTokenState, IdaWorker, WorkerBackend};
     use std::sync::mpsc;
 
     fn test_worker() -> IdaWorker {
@@ -2930,12 +2900,12 @@ mod tests {
 
     #[test]
     fn close_token_is_reused_for_same_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         let first = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
         let second = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("same session should reuse token");
 
         assert_eq!(first.token, second.token);
@@ -2945,13 +2915,13 @@ mod tests {
 
     #[test]
     fn close_tokens_are_fresh_uuid_v4_bearer_capabilities() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         let first = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
-        worker.clear_close_token();
+        let worker = CloseTokenState::default();
         let second = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("second issue should succeed");
 
         assert_ne!(first.token, second.token);
@@ -2965,22 +2935,22 @@ mod tests {
 
     #[test]
     fn close_token_is_denied_for_different_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         let denied = worker
-            .issue_close_token_for_session("session-b")
+            .issue_for_session("session-b")
             .expect_err("different session should be denied");
         assert_eq!(denied, "session-a");
     }
 
     #[test]
     fn owner_session_can_close_without_token() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         assert_eq!(
@@ -2991,9 +2961,9 @@ mod tests {
 
     #[test]
     fn force_close_can_override_other_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         assert_eq!(
@@ -3006,9 +2976,9 @@ mod tests {
 
     #[test]
     fn token_grants_close_from_any_session() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         let grant = worker
-            .issue_close_token_for_session("session-a")
+            .issue_for_session("session-a")
             .expect("first issue should succeed");
 
         assert_eq!(
@@ -3019,7 +2989,7 @@ mod tests {
 
     #[test]
     fn close_is_granted_when_no_lease_exists() {
-        let worker = test_worker();
+        let worker = CloseTokenState::default();
         assert_eq!(
             worker.authorize_close("session-x", None, false),
             CloseAuthorization::Granted

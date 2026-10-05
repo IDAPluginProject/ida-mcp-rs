@@ -281,7 +281,7 @@ struct ServeHttpArgs {
     /// Pass `*` or an empty value to disable the Host check.
     #[arg(long, value_delimiter = ',')]
     allow_host: Option<Vec<String>>,
-    /// Maximum child worker processes in pooled mode. 1 preserves legacy in-process HTTP behavior.
+    /// Maximum child worker processes. 1 shares one database across HTTP clients.
     #[arg(long, default_value_t = 1)]
     max_workers: usize,
     /// Minimum idle child worker processes to keep warm in pooled mode.
@@ -365,12 +365,8 @@ fn main() -> anyhow::Result<()> {
             run_server_workspace(build_filter()?, worker_args, workspace)
         }
         Command::Serve => run_server(build_filter()?, worker_args, workspace),
-        Command::ServeHttp(args) => {
-            run_server_http(args, build_filter()?, worker_args, allow_lumina, workspace)
-        }
-        Command::Worker(_args) => {
-            run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
-        }
+        Command::ServeHttp(args) => run_server_http(args, build_filter()?, worker_args, workspace),
+        Command::Worker(_args) => run_worker_server(build_filter()?, allow_lumina),
         Command::Probe(args) => run_probe(args, allow_lumina),
     };
     let log_result = match log_guard.shutdown() {
@@ -462,6 +458,25 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
     }
 }
 
+/// Preserve the database before cancelling task futures or retiring its child.
+async fn shutdown_supervised(
+    pool: &WorkerPool,
+    tasks: &TaskRegistry,
+    close: impl std::future::Future<Output = Result<(), ida_mcp::error::ToolError>>,
+) {
+    pool.begin_shutdown().await;
+    tokio::pin!(close);
+    match tokio::time::timeout(Duration::from_secs(120), &mut close).await {
+        Ok(Ok(())) | Ok(Err(ida_mcp::error::ToolError::NoDatabaseOpen)) => {}
+        Ok(Err(error)) => warn!(%error, "IDA database close failed during shutdown"),
+        Err(_) => warn!("IDA database close timed out during shutdown; retiring the child"),
+    }
+    cancel_background_tasks(tasks, "Cancelled by server shutdown");
+    // Keep the close future alive until retirement has finished; dropping an
+    // unfinished close earlier would delegate cleanup to a detached guard.
+    pool.shutdown_all().await;
+}
+
 /// The default stdio server: the implicit single-database API served by a
 /// router whose IDA runs in one supervised child process.
 ///
@@ -509,6 +524,8 @@ fn run_server(
         }
         let server = IdaMcpServer::with_filter(backend, ServerMode::Stdio, filter.clone());
         let task_registry = server.task_registry().clone();
+        // EOF drops rmcp's handler. Retain its task lifetime through saving.
+        let server_lifetime = server.clone();
         let sanitized = SanitizedIdaServer::with_filter(server, filter);
         let mut service = sanitized
             .serve(stdio())
@@ -526,32 +543,19 @@ fn run_server(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    cancel_background_tasks(&task_registry, "Cancelled by server shutdown");
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
                     if service.is_transport_closed() {
-                        cancel_background_tasks(&task_registry, "Cancelled by client disconnect");
                         break;
                     }
                 }
             }
         }
         info!("MCP server shutting down");
+        shutdown_supervised(&pool, &task_registry, database.close()).await;
         let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
-        // Give IDA a chance to save and pack, but never inherit the normal
-        // long-running operation budget during process shutdown. Keep the
-        // close future alive until the pool has finished retiring its child;
-        // dropping it early would hand cleanup to a detached retirement guard.
-        let close = database.close();
-        tokio::pin!(close);
-        if tokio::time::timeout(Duration::from_secs(10), &mut close)
-            .await
-            .is_err()
-        {
-            warn!("IDA database close timed out during shutdown; retiring the child");
-        }
-        pool.shutdown_all().await;
+        drop(server_lifetime);
         info!("Server stopped");
         Ok::<_, anyhow::Error>(())
     });
@@ -585,6 +589,7 @@ fn run_server_workspace(
             ServerRuntimeState::new(),
         );
         let task_registry = server.task_registry().clone();
+        let server_lifetime = server.clone();
         let sanitized = SanitizedIdaServer::with_workspace(server, filter);
         let mut service = sanitized
             .serve(stdio())
@@ -602,20 +607,22 @@ fn run_server_workspace(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    cancel_background_tasks(&task_registry, "Cancelled by server shutdown");
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
                     if service.is_transport_closed() {
-                        cancel_background_tasks(&task_registry, "Cancelled by client disconnect");
                         break;
                     }
                 }
             }
         }
+        shutdown_supervised(&pool, &task_registry, async {
+            registry.shutdown().await;
+            Ok(())
+        })
+        .await;
         let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
-        registry.shutdown().await;
-        pool.shutdown_all().await;
+        drop(server_lifetime);
         Ok::<_, anyhow::Error>(())
     });
     // A signal-driven shutdown can leave the stdin reader blocked on a client
@@ -624,20 +631,13 @@ fn run_server_workspace(
     result
 }
 
-fn run_server_with_mode(
-    filter: Arc<ToolFilter>,
-    mode: ServerMode,
-    allow_lumina: bool,
-) -> anyhow::Result<()> {
-    info!(?mode, "Starting IDA MCP Server (stdio transport)");
+fn run_worker_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Result<()> {
+    info!("Starting supervised IDA child (stdio transport)");
     let init_state = init_stdio_ida_state(allow_lumina)?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    let worker = match mode {
-        ServerMode::Worker => IdaWorker::supervised(tx),
-        ServerMode::Stdio | ServerMode::Http => IdaWorker::new(tx),
-    };
+    let worker = IdaWorker::supervised(tx);
     let backend = WorkerBackend::local(Arc::new(worker.clone()));
     let sdk_crash = ida_mcp::crash_guard::SdkCrashSignal::default();
     let sdk_crash_for_server = sdk_crash.clone();
@@ -657,15 +657,12 @@ fn run_server_with_mode(
             info!("MCP server listening on stdio");
             let server = IdaMcpServer::with_filter(
                 worker_for_server,
-                mode,
+                ServerMode::Worker,
                 filter_for_server.clone(),
             );
             let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
-            let sanitized = match mode {
-                ServerMode::Worker => sanitized.reporting_sdk_crashes(sdk_crash_for_server),
-                ServerMode::Stdio | ServerMode::Http => sanitized,
-            };
+            let sanitized = sanitized.reporting_sdk_crashes(sdk_crash_for_server);
             let mut service = match sanitized.serve(stdio()).await {
                 Ok(running) => Some(running),
                 Err(e) => {
@@ -767,7 +764,6 @@ fn run_server_http(
     args: ServeHttpArgs,
     filter: Arc<ToolFilter>,
     worker_args: Vec<OsString>,
-    allow_lumina: bool,
     workspace: WorkspaceArgs,
 ) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
@@ -814,134 +810,134 @@ fn run_server_http(
         );
     }
 
-    info!(
-        "HTTP worker pool disabled (max_workers=1); HTTP sessions share one IDA context. \
-         Pass --max-workers N where N > 1 for concurrent multi-IDB analysis."
-    );
+    info!("HTTP sessions share one supervised IDA worker");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+    let result = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
+        let listen_addr = listener
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("failed to read listener address: {e}"))?;
 
-    let init_state = ida::IdaInitState::deferred(allow_lumina)
-        .map_err(|e| anyhow::anyhow!("IDA startup preparation failed: {e}"))?;
-    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
-    let worker = Arc::new(IdaWorker::new(tx));
-    let backend = WorkerBackend::local(worker.clone());
+        let access_policy =
+            HttpAccessPolicy::from_cli(listen_addr, &args.allow_origin, args.allow_host.as_deref());
+        info!("HTTP Host guard: {}", access_policy.host_policy_summary());
 
-    let worker_for_factory = backend.clone();
-    let worker_for_shutdown = backend.clone();
-    let filter_for_factory = filter.clone();
-    let runtime_state = if args.stateless {
-        ServerRuntimeState::new_stateless_http()
-    } else {
-        ServerRuntimeState::new()
-    };
-    let worker_for_startup_failure = backend.clone();
-    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
+        let exe_path = std::env::current_exe()
+            .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: 1,
+            min_workers: 1,
+            worker_idle_timeout: Duration::ZERO,
+            worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
+            exe_path,
+            worker_args,
+        });
+        if let Err(error) = pool.warm_min().await {
+            pool.shutdown_all().await;
+            return Err(anyhow::anyhow!(
+                "could not start the IDA worker process ({error}); check that ida-mcp \
+                     is executable and, on Windows, sits beside IDA's DLLs"
+            ));
+        }
+        // All handler instances, including fresh sessionless handlers,
+        // share this binding and its generation-scoped close ownership.
+        let database = Arc::new(WorkspaceDatabase::new_shared_http(pool.clone()));
+        let backend = WorkerBackend::pooled(database.clone());
+        let runtime_state = if args.stateless {
+            ServerRuntimeState::new_stateless_http()
+        } else {
+            ServerRuntimeState::new()
+        };
+        let task_registry = runtime_state.task_registry().clone();
 
-        let result = rt.block_on(async move {
-            let listener = tokio::net::TcpListener::bind(bind_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
-            let listen_addr = listener
-                .local_addr()
-                .map_err(|e| anyhow::anyhow!("failed to read listener address: {e}"))?;
+        let session_manager = build_session_manager(session_keep_alive_secs);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let config = build_streamable_config(
+            HttpServerOptions {
+                sse_keep_alive_secs: args.sse_keep_alive_secs,
+                stateless: args.stateless,
+                json_response: args.json_response,
+                max_request_body_mib: args.max_request_body_mib,
+            },
+            cancel.clone(),
+        );
 
-            let access_policy = HttpAccessPolicy::from_cli(
-                listen_addr,
-                &args.allow_origin,
-                args.allow_host.as_deref(),
-            );
-            info!("HTTP Host guard: {}", access_policy.host_policy_summary());
+        let service = StreamableHttpService::new(
+            move || {
+                let inner = IdaMcpServer::with_filter_and_state(
+                    backend.clone(),
+                    ServerMode::Http,
+                    filter.clone(),
+                    runtime_state.clone(),
+                );
+                Ok(SanitizedIdaServer::with_filter(inner, filter.clone()))
+            },
+            session_manager,
+            config,
+        );
+        let service = HttpAccessService::new(service, access_policy);
 
-            let session_manager = build_session_manager(session_keep_alive_secs);
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let config = build_streamable_config(
-                HttpServerOptions {
-                    sse_keep_alive_secs: args.sse_keep_alive_secs,
-                    stateless: args.stateless,
-                    json_response: args.json_response,
-                    max_request_body_mib: args.max_request_body_mib,
-                },
-                cancel.clone(),
-            );
+        let router = Router::new().route_service("/", service);
+        info!("MCP HTTP server listening on http://{listen_addr}");
 
-            let service = StreamableHttpService::new(
-                move || {
-                    let inner = IdaMcpServer::with_filter_and_state(
-                        worker_for_factory.clone(),
-                        ServerMode::Http,
-                        filter_for_factory.clone(),
-                        runtime_state.clone(),
-                    );
-                    Ok(SanitizedIdaServer::with_filter(
-                        inner,
-                        filter_for_factory.clone(),
-                    ))
-                },
-                session_manager,
-                config,
-            );
-            let service = HttpAccessService::new(service, access_policy);
-
-            let router = Router::new().route_service("/", service);
-            info!("MCP HTTP server listening on http://{listen_addr}");
-
-            let shutdown_worker = worker_for_shutdown.clone();
-            let cancel_for_shutdown = cancel.clone();
-            tokio::spawn(async move {
-                if wait_for_shutdown_signal().await.is_ok() {
-                    let _ = shutdown_worker.close_for_shutdown().await;
-                    let _ = shutdown_worker.shutdown().await;
-                    cancel_for_shutdown.cancel();
-                }
-            });
-
-            let cancel_for_serve = cancel.clone();
+        let stop_accepting = tokio_util::sync::CancellationToken::new();
+        let cancel_for_serve = stop_accepting.clone();
+        let serve = async move {
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     cancel_for_serve.cancelled().await;
                     info!("HTTP server shutting down");
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
-            Ok::<_, anyhow::Error>(())
-        });
-        if let Err(err) = &result {
-            error!("HTTP server error: {err}");
-            // The main thread is parked in run_ida_loop and nothing else will
-            // send it a shutdown request, so a failed startup would otherwise
-            // wedge the process alive holding an IDA license with no listener.
-            rt.block_on(shutdown_worker_bounded(&worker_for_startup_failure));
-        }
-        result
+        };
+        tokio::pin!(serve);
+        let serve_result = tokio::select! {
+            result = &mut serve => Some(result),
+            shutdown = wait_for_shutdown_signal() => {
+                if let Err(error) = shutdown {
+                    warn!(%error, "Shutdown signal handler failed");
+                }
+                None
+            },
+        };
+        stop_accepting.cancel();
+        let shutdown = async {
+            shutdown_supervised(&pool, &task_registry, database.close()).await;
+            cancel.cancel();
+        };
+        let serve_result = match serve_result {
+            Some(result) => {
+                shutdown.await;
+                result
+            }
+            None => {
+                // Drive graceful HTTP draining throughout the database save.
+                let drain = async {
+                    tokio::select! {
+                        result = &mut serve => return result,
+                        _ = cancel.cancelled() => {}
+                    }
+                    match tokio::time::timeout(Duration::from_secs(2), &mut serve).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!("HTTP connections did not close during shutdown; dropping them");
+                            Ok(())
+                        }
+                    }
+                };
+                let ((), result) = tokio::join!(shutdown, drain);
+                result
+            }
+        };
+        serve_result.map_err(|error| anyhow::anyhow!("serve failed: {error}"))
     });
-
-    info!("Starting IDA worker loop");
-    ida::run_ida_loop(
-        rx,
-        init_state,
-        ida_mcp::crash_guard::SdkCrashSignal::default(),
-    );
-    info!("IDA worker loop finished");
-
-    // Propagate startup/serve failures into the exit status so supervisors can
-    // tell "could not start" from a clean shutdown.
-    match server_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            error!("Server thread failed: {e}");
-            return Err(e);
-        }
-        Err(e) => {
-            error!("Server thread panicked: {:?}", e);
-            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
-        }
-    }
-
-    info!("Server stopped");
-    Ok(())
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 fn run_server_http_pooled(
