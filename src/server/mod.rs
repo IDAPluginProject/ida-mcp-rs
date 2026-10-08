@@ -7493,7 +7493,7 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
             .destructive(true)
             .open_world(false),
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
-        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
+        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "save_idb" | "close_idb"
         | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
         | "rename" | "rename_lvar" | "set_lvar_type" | "set_comments" | "debug_open_module" => {
             ToolAnnotations::new()
@@ -9457,6 +9457,15 @@ mod tests {
             missing_schemas.is_empty(),
             "every registered tool must have a help/schema entry; missing: {missing_schemas:?}"
         );
+    }
+
+    #[test]
+    fn save_annotation_agrees_with_read_only_filter() {
+        assert!(crate::server::tool_filter::READ_ONLY_DENY_LIST.contains(&"save_idb"));
+        let save = tool_annotations_for("save_idb");
+        assert_eq!(save.read_only_hint, Some(false));
+        assert_eq!(save.destructive_hint, Some(false));
+        assert_ne!(save.idempotent_hint, Some(true));
     }
 
     #[test]
