@@ -1104,6 +1104,52 @@ pub fn run_ida_loop(
                 });
                 let _ = resp.send(result);
             }
+            IdaRequest::ListPseudocodeComments {
+                addr,
+                name,
+                offset,
+                limit,
+                resp,
+            } => {
+                let result = crash_guard.run("handle_list_pseudocode_comments", || {
+                    annotations::handle_list_pseudocode_comments(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
+                        offset,
+                        limit,
+                    )
+                });
+                let _ = resp.send(result);
+            }
+            IdaRequest::SetPseudocodeComment {
+                addr,
+                name,
+                locator,
+                comment,
+                admission,
+                resp,
+            } => {
+                admit_or_reject!(admission, resp);
+                let result = crash_guard.run("handle_set_pseudocode_comment", || {
+                    annotations::handle_set_pseudocode_comment(
+                        &idb,
+                        effective_database_path.as_deref(),
+                        TargetSpec {
+                            addr,
+                            name: name.as_deref(),
+                            offset: 0,
+                        },
+                        &locator,
+                        &comment,
+                    )
+                });
+                let _ = resp.send(result);
+            }
             IdaRequest::Segments { resp } => {
                 debug!("Listing segments");
                 let result = crash_guard.run("handle_segments", || segments::handle_segments(&idb));
@@ -2331,6 +2377,8 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::Decompile { resp, .. } => reject!(resp, err),
         IdaRequest::ListLvars { resp, .. } => reject!(resp, err),
         IdaRequest::RenameLvar { resp, .. } => reject!(resp, err),
+        IdaRequest::ListPseudocodeComments { resp, .. } => reject!(resp, err),
+        IdaRequest::SetPseudocodeComment { resp, .. } => reject!(resp, err),
         IdaRequest::SetLvarType { resp, .. } => reject!(resp, err),
         IdaRequest::Segments { resp, .. } => reject!(resp, err),
         IdaRequest::Strings { resp, .. } => reject!(resp, err),

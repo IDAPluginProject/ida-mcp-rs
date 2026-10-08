@@ -114,6 +114,10 @@ test-decompile: test-bootstrap
 test-lvars: test-bootstrap
     python3 ./stdio_lvars.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
 
+# Verify pseudocode comments on private databases in normal and workspace modes.
+test-pseudocode-comments: test-bootstrap
+    python3 ./stdio_pseudocode_comments.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+
 # Verify that license validation succeeds during preflight or database open.
 test-license: fixture
     #!/usr/bin/env bash

@@ -5,7 +5,7 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns 74 baseline tools by default (81 registered including opt-in workspace and debugger tools)
+- `tools/list` returns 76 baseline tools by default (83 registered including opt-in workspace and debugger tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`
@@ -71,6 +71,7 @@ Decompile functions to pseudocode (requires Hex-Rays)
 |------|-------------|
 | `decompile` | Decompile one or more functions to C pseudocode |
 | `list_lvars` | List decompiler locals and arguments in one function |
+| `list_pseudocode_comments` | List pseudocode comment locations in one function |
 | `pseudocode_at` | Get pseudocode for one or more addresses/ranges |
 
 ## Xrefs (`xrefs`)
@@ -168,7 +169,8 @@ Patching, renaming, and comment editing
 | `patch_asm` | Patch instructions with assembly text |
 | `rename` | Rename symbols |
 | `rename_lvar` | Rename one exact decompiler local variable |
-| `set_comments` | Set comments at an address |
+| `set_comments` | Set a disassembly comment at an address |
+| `set_pseudocode_comment` | Set a persistent pseudocode comment |
 
 ## Debug (`debug`)
 

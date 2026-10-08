@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use idalib::decompiler::CFunction;
 use idalib::IDB;
 
 use crate::error::ToolError;
@@ -218,6 +219,25 @@ pub(crate) fn acting_at(target: MutationTarget, address: u64) -> MutationTarget 
         address: format!("{address:#x}"),
         ..target
     }
+}
+
+/// Resolve an exact function target and decompile the whole function,
+/// reporting the function start as the acting address.
+pub(crate) fn decompile_mutation_target<'a>(
+    idb: &'a Option<IDB>,
+    database: Option<&Path>,
+    spec: TargetSpec<'_>,
+) -> Result<(CFunction<'a>, MutationTarget), ToolError> {
+    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let (address, target) = resolve_mutation_target(db, database, spec)?;
+    if !db.decompiler_available() {
+        return Err(ToolError::DecompilerUnavailable);
+    }
+    let function = db
+        .function_at(address)
+        .ok_or(ToolError::FunctionNotFound(address))?;
+    let target = acting_at(target, function.start_address());
+    Ok((db.decompile(&function)?, target))
 }
 
 #[cfg(test)]

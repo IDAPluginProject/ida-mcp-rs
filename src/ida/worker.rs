@@ -646,6 +646,46 @@ impl IdaWorker {
         self.recv_side_effect(rx, admission, timeout_secs).await
     }
 
+    pub async fn list_pseudocode_comments(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListPseudocodeCommentsResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListPseudocodeComments {
+            addr,
+            name,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        self.recv_read_only_with_timeout(rx, timeout_secs).await
+    }
+
+    pub async fn set_pseudocode_comment(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetPseudocodeCommentResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        let admission = SideEffectAdmission::default();
+        self.try_send(IdaRequest::SetPseudocodeComment {
+            addr,
+            name,
+            locator,
+            comment,
+            admission: admission.clone(),
+            resp: tx,
+        })?;
+        self.recv_side_effect(rx, admission, timeout_secs).await
+    }
+
     /// List all segments.
     pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -1967,6 +2007,50 @@ impl WorkerBackend {
             Self::Pooled(state) => {
                 state
                     .set_lvar_type(addr, name, selector, decl, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn list_pseudocode_comments(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListPseudocodeCommentsResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .list_pseudocode_comments(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .list_pseudocode_comments(addr, name, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn set_pseudocode_comment(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetPseudocodeCommentResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .set_pseudocode_comment(addr, name, locator, comment, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .set_pseudocode_comment(addr, name, locator, comment, timeout_secs)
                     .await
             }
         }

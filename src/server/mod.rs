@@ -4437,7 +4437,7 @@ impl IdaMcpServer {
                     .to_tool_result(),
             );
         }
-        let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
         match self
             .worker
             .list_lvars(addr, req.target_name, offset, limit, Some(timeout))
@@ -4460,7 +4460,7 @@ impl IdaMcpServer {
             req.target_name.as_deref(),
             "target_name"
         ));
-        let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
         let selector = try_param!(crate::ida::handlers::lvars::local_selector(
             req.lvar_name,
             req.lvar_locator
@@ -4487,7 +4487,7 @@ impl IdaMcpServer {
             req.target_name.as_deref(),
             "target_name"
         ));
-        let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
         let selector = try_param!(crate::ida::handlers::lvars::local_selector(
             req.lvar_name,
             req.lvar_locator
@@ -4495,6 +4495,71 @@ impl IdaMcpServer {
         match self
             .worker
             .set_lvar_type(addr, req.target_name, selector, req.decl, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "List end-of-line comment locations in one function's Hex-Rays pseudocode. Select one address or exact target_name; returns each line's locator, address, text, existing comment, and pagination."
+    )]
+    async fn list_pseudocode_comments(
+        &self,
+        Parameters(req): Parameters<ListPseudocodeCommentsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        let offset =
+            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
+        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit")).unwrap_or(100);
+        if !(1..=1000).contains(&limit) {
+            return Ok(
+                ToolError::InvalidParams("limit must be between 1 and 1000".into())
+                    .to_tool_result(),
+            );
+        }
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        match self
+            .worker
+            .list_pseudocode_comments(addr, req.target_name, offset, limit, Some(timeout))
+            .await
+        {
+            Ok(result) => Ok(typed_result(&result)),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Set, replace, or remove a persistent Hex-Rays pseudocode comment. Select an exact function and a comment_locator from list_pseudocode_comments. Empty comment removes it; save_idb writes the database to disk."
+    )]
+    async fn set_pseudocode_comment(
+        &self,
+        Parameters(req): Parameters<SetPseudocodeCommentRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let addr = try_param!(Self::mutation_target_address(
+            req.address.as_ref(),
+            req.target_name.as_deref(),
+            "target_name"
+        ));
+        try_param!(crate::ida::handlers::annotations::check_pseudocode_comment(
+            &req.comment_locator,
+            &req.comment
+        ));
+        let timeout = try_param!(decompiler_timeout(req.timeout_secs));
+        match self
+            .worker
+            .set_pseudocode_comment(
+                addr,
+                req.target_name,
+                req.comment_locator,
+                req.comment,
+                Some(timeout),
+            )
             .await
         {
             Ok(result) => Ok(typed_result(&result)),
@@ -5635,7 +5700,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Set comments at an address")]
+    #[tool(
+        description = "Set a disassembly comment at an address. Disassembly comments do not appear in Hex-Rays pseudocode; use set_pseudocode_comment for those."
+    )]
     async fn set_comments(
         &self,
         Parameters(req): Parameters<SetCommentsRequest>,
@@ -7006,7 +7073,7 @@ fn typed_result<T: Serialize + std::fmt::Debug>(value: &T) -> CallToolResult {
     result
 }
 
-fn lvar_timeout(value: Option<i64>) -> Result<u64, ToolError> {
+fn decompiler_timeout(value: Option<i64>) -> Result<u64, ToolError> {
     let seconds = parse_optional_unsigned::<u64>(value, "timeout_secs")?.unwrap_or(120);
     if !(1..=MAX_TIMEOUT_SECS).contains(&seconds) {
         return Err(ToolError::InvalidParams(
@@ -7051,6 +7118,13 @@ enum XrefsOutput {
     Batch { results: Vec<XrefsBatchEntry> },
 }
 
+/// Listing tools whose result reports a `MutationTarget`, which can carry a
+/// null database or symbol. Their schemas keep those nulls instead of being
+/// normalized, so the other tools' output contracts do not widen.
+fn reports_mutation_target(name: &str) -> bool {
+    ["list_lvars", "list_pseudocode_comments"].contains(&name)
+}
+
 /// Output schema for tools whose result is a typed object. Tools whose
 /// result is a bare array or a shape built per call advertise none.
 ///
@@ -7068,13 +7142,12 @@ fn tool_output_schema(name: &str) -> Option<Value> {
         "resolve_function" => schema::<crate::ida::types::FunctionInfo>(),
         "function_at" => schema::<crate::ida::types::FunctionRangeInfo>(),
         "list_lvars" => schema::<crate::ida::types::ListLvarsResult>(),
+        "list_pseudocode_comments" => schema::<crate::ida::types::ListPseudocodeCommentsResult>(),
         "strings" => schema::<crate::ida::types::StringListResult>(),
         "xrefs_to" | "xrefs_from" => schema::<XrefsOutput>(),
         _ => return None,
     };
-    // list_lvars can report a target with a null database or symbol. Keep
-    // those nulls without widening the existing tools' output contracts.
-    if name != "list_lvars" {
+    if !reports_mutation_target(name) {
         normalize_schema_value(&mut value);
     }
     if let Value::Object(root) = &mut value {
@@ -7130,6 +7203,8 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "rename_lvar" => Some(schema::<RenameLvarRequest>()),
         "set_lvar_type" => Some(schema::<SetLvarTypeRequest>()),
         "pseudocode_at" => Some(schema::<PseudocodeAtRequest>()),
+        "list_pseudocode_comments" => Some(schema::<ListPseudocodeCommentsRequest>()),
+        "set_pseudocode_comment" => Some(schema::<SetPseudocodeCommentRequest>()),
 
         // Xrefs / Control flow
         "xrefs_to" | "xrefs_from" => Some(schema::<XrefsRequest>()),
@@ -7489,14 +7564,26 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
             .destructive(true)
             .open_world(false),
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
-        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "save_idb" | "close_idb"
-        | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
-        | "rename" | "rename_lvar" | "set_lvar_type" | "set_comments" | "debug_open_module" => {
-            ToolAnnotations::new()
-                .read_only(false)
-                .destructive(name == "close_idb")
-                .open_world(false)
-        }
+        "open_idb"
+        | "open_dsc"
+        | "dsc_add_dylib"
+        | "dsc_add_region"
+        | "save_idb"
+        | "close_idb"
+        | "load_debug_info"
+        | "declare_type"
+        | "apply_types"
+        | "declare_stack"
+        | "delete_stack"
+        | "rename"
+        | "rename_lvar"
+        | "set_lvar_type"
+        | "set_comments"
+        | "set_pseudocode_comment"
+        | "debug_open_module" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(name == "close_idb")
+            .open_world(false),
         _ => ToolAnnotations::new()
             .read_only(true)
             .destructive(false)
@@ -7876,14 +7963,15 @@ mod tests {
         find_target_dyld_cache, is_sessionless_request_meta, materialize_task_response,
         normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
-        raw_blob_database_exists, run_script_failure_message, run_script_succeeded,
-        run_script_timeout_message, run_script_truncate_chars, runtime_module_preferred_base,
-        segment_defines_runtime_image_base, select_runtime_module, supported_protocol_versions,
-        target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
-        task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
-        workspace_close_should_remove_entry, workspace_tool_example, DscOpenPlan, IdaMcpServer,
-        OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest,
-        ToolHelpRequest, XrefsRequest,
+        raw_blob_database_exists, reports_mutation_target, run_script_failure_message,
+        run_script_succeeded, run_script_timeout_message, run_script_truncate_chars,
+        runtime_module_preferred_base, segment_defines_runtime_image_base, select_runtime_module,
+        supported_protocol_versions, target_dyld_cache_names, task, task_payload_result_value,
+        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
+        tool_annotations_for, tool_params_schema, workspace_close_should_remove_entry,
+        workspace_tool_example, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
+        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
+        XrefsRequest,
     };
     use crate::server::{
         tool_output_schema, typed_result, AnalysisStatusOutput, XrefsBatchEntry, XrefsOutput,
@@ -8109,8 +8197,8 @@ mod tests {
     fn output_schemas_match_the_structured_results() {
         use crate::ida::types::{
             AnalysisStatus, FunctionInfo, FunctionListResult, FunctionRangeInfo, ListLvarsResult,
-            LocalVariableInfo, MutationTarget, StringInfo, StringListResult, TargetSelector,
-            XRefInfo, XRefListResult,
+            ListPseudocodeCommentsResult, LocalVariableInfo, MutationTarget, PseudocodeCommentInfo,
+            StringInfo, StringListResult, TargetSelector, XRefInfo, XRefListResult,
         };
 
         let advertised: Vec<&str> = crate::tool_registry::all_tools()
@@ -8125,6 +8213,7 @@ mod tests {
                 "resolve_function",
                 "function_at",
                 "list_lvars",
+                "list_pseudocode_comments",
                 "xrefs_to",
                 "xrefs_from",
                 "strings",
@@ -8139,7 +8228,7 @@ mod tests {
                 "{name} output schema lacks a root type: {schema}"
             );
             assert!(!contains_schema_key(&schema), "{name} schema keeps $schema");
-            if *name != "list_lvars" {
+            if !reports_mutation_target(name) {
                 let mut normalized = schema.clone();
                 normalize_schema_value(&mut normalized);
                 assert_eq!(schema, normalized, "{name} widened its output schema");
@@ -8224,10 +8313,25 @@ mod tests {
             (
                 "list_lvars",
                 typed_result(&ListLvarsResult {
-                    target,
+                    target: target.clone(),
                     lvars: vec![variable],
                     total: 1,
                     next_offset: None,
+                }),
+            ),
+            (
+                "list_pseudocode_comments",
+                typed_result(&ListPseudocodeCommentsResult {
+                    target,
+                    locations: vec![PseudocodeCommentInfo {
+                        locator: "pcmt1:950:1000:1004:4a".into(),
+                        address: "0x1004".into(),
+                        line_number: 7,
+                        text: "  else".into(),
+                        comment: String::new(),
+                    }],
+                    total: 3,
+                    next_offset: Some(1),
                 }),
             ),
             (
@@ -8294,11 +8398,13 @@ mod tests {
     }
 
     #[test]
-    fn lvar_annotations_match_their_effects() {
+    fn decompiler_edit_annotations_match_their_effects() {
         for (name, read_only) in [
             ("list_lvars", true),
             ("rename_lvar", false),
             ("set_lvar_type", false),
+            ("list_pseudocode_comments", true),
+            ("set_pseudocode_comment", false),
         ] {
             assert_eq!(
                 tool_annotations_for(name).read_only_hint,
@@ -9576,7 +9682,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "0fed4e57b38d78a10347111b1e9e9eae1aec07b36b39f83965a04ad5ce3aca3b"
+            "b3471fa79a0b10935aa2f17d4441548867f9aecd6e22c9db1d121ad1ee50e037"
         );
     }
 

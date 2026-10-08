@@ -1117,6 +1117,57 @@ pub struct PseudocodeAtRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListPseudocodeCommentsRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(description = "Pagination offset (default: 0)", range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(
+        description = "Maximum locations (1-1000, default: 100)",
+        range(min = 1, max = 1000)
+    )]
+    pub limit: Option<i64>,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetPseudocodeCommentRequest {
+    #[schemars(description = "One address in the function (string/number)")]
+    #[serde(alias = "addr", alias = "ea")]
+    pub address: Option<Value>,
+    #[schemars(
+        description = "Exact, case-sensitive function symbol (alternative to address; pass one)"
+    )]
+    #[serde(alias = "function_name")]
+    pub target_name: Option<String>,
+    #[schemars(
+        description = "Exact locator from list_pseudocode_comments",
+        length(min = 1, max = 128)
+    )]
+    pub comment_locator: String,
+    #[schemars(
+        description = "Comment text; empty string removes it (maximum 16384 UTF-8 bytes)",
+        length(max = 16384)
+    )]
+    pub comment: String,
+    #[schemars(
+        description = "Timeout in seconds (default: 120, max: 600)",
+        range(min = 1, max = 600)
+    )]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ToolCatalogRequest {
     #[schemars(
         description = "What you're trying to accomplish (e.g., 'find all callers of a function')"

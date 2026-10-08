@@ -601,6 +601,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["decompiler", "locals", "variables", "arguments", "lvars"],
     },
+    ToolInfo {
+        name: "list_pseudocode_comments",
+        category: ToolCategory::Decompile,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "List pseudocode comment locations in one function",
+        full_desc: "List the end-of-line comment locations in one function's Hex-Rays pseudocode, with each line's locator, address, text, and existing comment. Select one address or an exact function symbol; results are paginated.",
+        example: r#"{"target_name": "main", "limit": 100}"#,
+        default: false,
+        keywords: &["pseudocode", "decompiler", "comments", "locations"],
+    },
     // === XREFS ===
     ToolInfo {
         name: "xrefs_to",
@@ -1107,14 +1118,26 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     },
     // === EDITING / PATCHING ===
     ToolInfo {
+        name: "set_pseudocode_comment",
+        category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Set a persistent pseudocode comment",
+        full_desc: "Set, replace, or remove a Hex-Rays pseudocode comment at an exact comment_locator from list_pseudocode_comments. Select one address or an exact function symbol. Empty text removes the comment; save_idb writes it to disk.",
+        example: r#"{"target_name": "main", "comment_locator": "<locator from list_pseudocode_comments>", "comment": "validated input"}"#,
+        default: false,
+        keywords: &["pseudocode", "decompiler", "comments", "annotate"],
+    },
+    ToolInfo {
         name: "set_comments",
         category: ToolCategory::Editing,
         scope: ToolScope::Database,
         requirements: ToolRequirements::BASELINE,
-        short_desc: "Set comments at an address",
-        full_desc: "Set a non-repeatable or repeatable comment at an address. \
+        short_desc: "Set a disassembly comment at an address",
+        full_desc: "Set a non-repeatable or repeatable disassembly comment at an address. \
                     Empty string clears the comment. You can also supply a symbol/function name \
-                    with an optional offset.",
+                    with an optional offset. Disassembly comments do not appear in Hex-Rays \
+                    pseudocode; use list_pseudocode_comments and set_pseudocode_comment for those.",
         example: r#"{"name": "interesting_function", "comment": "note", "repeatable": false}"#,
         default: false,
         keywords: &["comments", "set", "annotate"],

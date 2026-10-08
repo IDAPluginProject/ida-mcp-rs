@@ -178,6 +178,21 @@ pub enum IdaRequest {
         admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<SetLvarTypeResult, ToolError>>,
     },
+    ListPseudocodeComments {
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<ListPseudocodeCommentsResult, ToolError>>,
+    },
+    SetPseudocodeComment {
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        admission: SideEffectAdmission,
+        resp: oneshot::Sender<Result<SetPseudocodeCommentResult, ToolError>>,
+    },
     Segments {
         resp: oneshot::Sender<Result<Vec<SegmentInfo>, ToolError>>,
     },

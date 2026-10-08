@@ -50,6 +50,16 @@ pub(crate) fn try_parse_address(s: &str) -> Option<u64> {
     parse_address_str(s).ok()
 }
 
+/// Reject empty, oversized, or NUL-containing text before it reaches IDA.
+pub(crate) fn checked_text(value: &str, field: &str, max: usize) -> Result<(), ToolError> {
+    if value.is_empty() || value.len() > max || value.contains('\0') {
+        return Err(ToolError::InvalidParams(format!(
+            "{field} must contain 1–{max} bytes and no NUL"
+        )));
+    }
+    Ok(())
+}
+
 /// Encode bytes as hex string.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;

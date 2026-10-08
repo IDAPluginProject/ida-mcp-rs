@@ -449,13 +449,13 @@ pub enum TargetSelector {
     Name,
 }
 
-/// The target a mutating tool resolved, recorded before it changed anything.
+/// The exact target a tool resolved, recorded before it acted.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct MutationTarget {
-    /// Database the mutation applied to, as `open_idb` reported it.
+    /// Database the tool acted on, as `open_idb` reported it.
     pub database: Option<String>,
     pub selector: TargetSelector,
-    /// Name at `base` before the mutation: the exact name that was matched,
+    /// Name at `base` before the tool acted: the exact name that was matched,
     /// or the listed name at a given address. `None` when that address has
     /// no listed name; nearby or generated names are never substituted.
     pub symbol: Option<String>,
@@ -464,8 +464,8 @@ pub struct MutationTarget {
     /// `base` plus the caller's `offset`: the address the caller asked for.
     pub requested_address: String,
     /// Address the tool acted on. Equal to `requested_address` except where
-    /// a tool normalizes it; `lumina_apply` acts on the start of the
-    /// function containing `requested_address`.
+    /// a tool normalizes it: `lumina_apply` and the decompiler tools act on
+    /// the start of the function containing `requested_address`.
     pub address: String,
 }
 
@@ -517,6 +517,36 @@ pub struct SetLvarTypeResult {
     pub variable: LocalVariableInfo,
     pub type_name: String,
     pub applied: bool,
+}
+
+/// One end-of-line comment location in a Hex-Rays decompilation.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct PseudocodeCommentInfo {
+    /// Opaque location identity for set_pseudocode_comment.
+    pub locator: String,
+    pub address: String,
+    /// One-based line in the rendered pseudocode.
+    pub line_number: u32,
+    /// The rendered line, including any existing comment.
+    pub text: String,
+    /// The complete existing comment, or empty.
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ListPseudocodeCommentsResult {
+    pub target: MutationTarget,
+    pub locations: Vec<PseudocodeCommentInfo>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetPseudocodeCommentResult {
+    pub target: MutationTarget,
+    pub comment_locator: String,
+    pub deleted: bool,
 }
 
 /// Xrefs to a struct field

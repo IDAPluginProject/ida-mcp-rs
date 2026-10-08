@@ -29,6 +29,7 @@ pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "rename_lvar",
     "set_lvar_type",
     "set_comments",
+    "set_pseudocode_comment",
     "lumina_apply",
     "declare_type",
     "apply_types",
@@ -435,6 +436,7 @@ mod tests {
             "load_debug_info",
             "lumina_lookup",
             "list_lvars",
+            "list_pseudocode_comments",
         ] {
             assert!(f.is_enabled(name), "read-only must keep {name}");
         }
@@ -528,7 +530,7 @@ mod tests {
         let err = ToolFilter::from_inputs(
             &cat("decompile"),
             &[],
-            &cat("decompile,pseudocode_at,list_lvars"),
+            &cat("decompile,pseudocode_at,list_lvars,list_pseudocode_comments"),
             false,
         )
         .expect_err("exclude wiping all includes must reject");

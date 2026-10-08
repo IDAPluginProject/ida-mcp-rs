@@ -6,7 +6,8 @@ use idalib::decompiler::{CFunction, LocalVariable};
 use idalib::IDB;
 
 use crate::error::ToolError;
-use crate::ida::handlers::target::{acting_at, resolve_mutation_target, TargetSpec};
+use crate::ida::handlers::checked_text;
+use crate::ida::handlers::target::{decompile_mutation_target, TargetSpec};
 use crate::ida::types::{
     ListLvarsResult, LocalVariableInfo, LocalVariableSelector, MutationTarget, RenameLvarResult,
     SetLvarTypeResult,
@@ -17,15 +18,6 @@ const MAX_LOCALS: usize = 100_000;
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_DECL_BYTES: usize = 16_384;
 const MAX_LOCATOR_BYTES: usize = 16_384;
-
-fn checked_text(value: &str, field: &str, max: usize) -> Result<(), ToolError> {
-    if value.is_empty() || value.len() > max || value.contains('\0') {
-        return Err(ToolError::InvalidParams(format!(
-            "{field} must contain 1–{max} bytes and no NUL"
-        )));
-    }
-    Ok(())
-}
 
 pub(crate) fn local_selector(
     name: Option<String>,
@@ -51,16 +43,7 @@ fn decompile_target<'a>(
     database: Option<&Path>,
     target: TargetSpec<'_>,
 ) -> Result<(CFunction<'a>, MutationTarget), ToolError> {
-    let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    let (address, target) = resolve_mutation_target(db, database, target)?;
-    if !db.decompiler_available() {
-        return Err(ToolError::DecompilerUnavailable);
-    }
-    let function = db
-        .function_at(address)
-        .ok_or(ToolError::FunctionNotFound(address))?;
-    let target = acting_at(target, function.start_address());
-    let cfunc = db.decompile(&function)?;
+    let (cfunc, target) = decompile_mutation_target(idb, database, target)?;
     if cfunc.local_variable_count()? > MAX_LOCALS {
         return Err(ToolError::IdaError(format!(
             "function has more than {MAX_LOCALS} decompiler locals"
@@ -235,9 +218,9 @@ pub(crate) fn handle_set_lvar_type(
 
 #[cfg(test)]
 mod tests {
+    use crate::ida::handlers::checked_text;
     use crate::ida::handlers::lvars::{
-        checked_text, exact_local_index, exact_locator_index, local_selector, MAX_DECL_BYTES,
-        MAX_LOCATOR_BYTES,
+        exact_local_index, exact_locator_index, local_selector, MAX_DECL_BYTES, MAX_LOCATOR_BYTES,
     };
 
     #[test]

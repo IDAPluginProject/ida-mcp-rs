@@ -19,6 +19,7 @@ just test-session-cancel # legacy-session cancel-on-disconnect test
 just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
 just test-stuck-call # Stuck-call retirement, immediate reopen, queued calls, orphans
 just test-lvars # Native Hex-Rays local edits, persistence, and read-only filtering
+just test-pseudocode-comments # Native pseudocode comment listing, edits, and persistence
 just test-shutdown-signal # Signal/EOF shutdown saves, hung-close deadline, SIGKILL flush
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
@@ -84,6 +85,11 @@ builds the debug binary before running its harness.
 - Rejects invalid names, missing or conflicting function selectors, and invalid or incompatible types without changing the local
 - Checks updated pseudocode and saved edits after reopening, on default stdio and `--workspace`
 - Confirms read-only mode keeps listing and rejects local edits
+
+**Pseudocode comment test** (`just test-pseudocode-comments`)
+- Lists and pages comment locations, including distinct `if` and `else` slots at one address
+- Rejects stale and wrong-function locators without changing any comment
+- Sets, replaces, and deletes comments, then checks the pseudocode after saving and reopening, on default stdio and `--workspace`
 
 **Stuck-call test** (`just test-stuck-call`)
 - Reopens immediately after a stuck call retires the worker, with no sleep or

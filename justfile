@@ -160,6 +160,10 @@ test-decompile: build
 test-lvars: build
     cd test && SERVER_BIN=../target/debug/ida-mcp just test-lvars
 
+# Verify exact pseudocode comment placement, persistence, and deletion.
+test-pseudocode-comments: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-pseudocode-comments
+
 # Run HTTP integration test (debug)
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http

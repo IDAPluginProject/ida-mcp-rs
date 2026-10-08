@@ -2830,6 +2830,47 @@ impl WorkspaceDatabase {
         .await
     }
 
+    pub async fn list_pseudocode_comments(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<ListPseudocodeCommentsResult, ToolError> {
+        self.call_json(
+            "list_pseudocode_comments",
+            json!({
+                "address": addr.map(remote::hex_addr), "target_name": name,
+                "offset": offset, "limit": limit, "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
+    pub async fn set_pseudocode_comment(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        locator: String,
+        comment: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<SetPseudocodeCommentResult, ToolError> {
+        self.call_json(
+            "set_pseudocode_comment",
+            json!({
+                "address": addr.map(remote::hex_addr), "target_name": name,
+                "comment_locator": locator, "comment": comment,
+                "timeout_secs": timeout_secs,
+            }),
+            timeout_secs,
+            None,
+        )
+        .await
+    }
+
     pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
         self.call_json("segments", json!({}), None, None).await
     }

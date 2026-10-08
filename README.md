@@ -257,6 +257,23 @@ save_idb()
 `set_lvar_type` in `types`. Add them to lean with
 `--profile=lean --tools=list_lvars,rename_lvar,set_lvar_type`.
 
+For end-of-line comments in Hex-Rays pseudocode, use
+`list_pseudocode_comments` with one function address or exact `target_name`.
+It returns each commentable line's opaque `locator`, address, text, and
+existing comment, paginated like `list_lvars`. Pass one `locator` to
+`set_pseudocode_comment` as `comment_locator`; an empty comment removes it. A stale locator fails
+without making a change; list the locations again after reanalysis.
+`set_comments` edits disassembly comments, which pseudocode does not show.
+
+```text
+list_pseudocode_comments(target_name: "interesting_function")
+set_pseudocode_comment(target_name: "interesting_function", comment_locator: "<locator from list_pseudocode_comments>", comment: "validated input")
+save_idb()
+```
+
+`list_pseudocode_comments` is in the `decompile` toolset and
+`set_pseudocode_comment` in `editing`.
+
 ## Opening binaries
 
 ### Raw blobs
@@ -378,10 +395,11 @@ All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API
 ## Structured results
 
 `analysis_status`, `list_functions`, `resolve_function`, `function_at`,
-`xrefs_to`, `xrefs_from`, `strings`, and `list_lvars` advertise an
-`outputSchema` and return `structuredContent` alongside the same JSON as
-text. `rename_lvar` and `set_lvar_type` also return structured results but
-omit their output schemas to keep the tool inventory smaller. Other tools
+`xrefs_to`, `xrefs_from`, `strings`, `list_lvars`, and
+`list_pseudocode_comments` advertise an `outputSchema` and return
+`structuredContent` alongside the same JSON as text. `rename_lvar`,
+`set_lvar_type`, and `set_pseudocode_comment` also return structured results
+but omit their output schemas to keep the tool inventory smaller. Other tools
 return JSON text only; tools whose result is a bare array or a per-call shape
 have no schema yet.
 
@@ -595,7 +613,7 @@ doesn't modify the database.
 
 ## Context optimization
 
-By default `tools/list` returns 74 tools. The full tool list is roughly 14k
+By default `tools/list` returns 76 tools. The full tool list is roughly 15k
 tokens, estimated at four characters per token. Seven more are opt-in: the six
 debugger tools and `list_databases` appear only with
 `--enable-debugger` or `--workspace`. Clients with dynamic tool discovery defer
@@ -608,9 +626,9 @@ surface to what you need:
 | `--toolsets=cat1,cat2` | `IDA_MCP_TOOLSETS` | Replaces "all tools" with the union of selected categories |
 | `--tools=t1,t2`        | `IDA_MCP_TOOLS`         | Adds individual tools (additive to `--toolsets`) |
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
-| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `save_idb`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
+| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `save_idb`, `patch*`, `rename`, comment setters, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-With no flags you get all 74 baseline tools (57.2 KB of schemas). Categories: `core`, `functions`,
+With no flags you get all 76 baseline tools. Categories: `core`, `functions`,
 `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
 `metadata`, `types`, `editing`, `scripting`; `debug` exists only when the
 debugger is enabled on a supported platform (run `tool_catalog` to list them).
@@ -654,7 +672,7 @@ request. No other client was measured.
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
   ```
-- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~14k tokens. Pick a focused subset as shown above.
+- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~15k tokens. Pick a focused subset as shown above.
 - **Gemini CLI:** filtering is optional, but a smaller surface cuts down on wrong tool picks when several MCP servers are enabled:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile --read-only
