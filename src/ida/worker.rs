@@ -608,7 +608,7 @@ impl IdaWorker {
         &self,
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         new_name: String,
         timeout_secs: Option<u64>,
     ) -> Result<RenameLvarResult, ToolError> {
@@ -617,7 +617,7 @@ impl IdaWorker {
         self.try_send(IdaRequest::RenameLvar {
             addr,
             name,
-            lvar_name,
+            selector,
             new_name,
             admission: admission.clone(),
             resp: tx,
@@ -629,7 +629,7 @@ impl IdaWorker {
         &self,
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         decl: String,
         timeout_secs: Option<u64>,
     ) -> Result<SetLvarTypeResult, ToolError> {
@@ -638,7 +638,7 @@ impl IdaWorker {
         self.try_send(IdaRequest::SetLvarType {
             addr,
             name,
-            lvar_name,
+            selector,
             decl,
             admission: admission.clone(),
             resp: tx,
@@ -1932,19 +1932,19 @@ impl WorkerBackend {
         &self,
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         new_name: String,
         timeout_secs: Option<u64>,
     ) -> Result<RenameLvarResult, ToolError> {
         match self {
             Self::Local(worker) => {
                 worker
-                    .rename_lvar(addr, name, lvar_name, new_name, timeout_secs)
+                    .rename_lvar(addr, name, selector, new_name, timeout_secs)
                     .await
             }
             Self::Pooled(state) => {
                 state
-                    .rename_lvar(addr, name, lvar_name, new_name, timeout_secs)
+                    .rename_lvar(addr, name, selector, new_name, timeout_secs)
                     .await
             }
         }
@@ -1954,19 +1954,19 @@ impl WorkerBackend {
         &self,
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         decl: String,
         timeout_secs: Option<u64>,
     ) -> Result<SetLvarTypeResult, ToolError> {
         match self {
             Self::Local(worker) => {
                 worker
-                    .set_lvar_type(addr, name, lvar_name, decl, timeout_secs)
+                    .set_lvar_type(addr, name, selector, decl, timeout_secs)
                     .await
             }
             Self::Pooled(state) => {
                 state
-                    .set_lvar_type(addr, name, lvar_name, decl, timeout_secs)
+                    .set_lvar_type(addr, name, selector, decl, timeout_secs)
                     .await
             }
         }

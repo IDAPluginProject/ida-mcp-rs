@@ -4417,7 +4417,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "List Hex-Rays locals and arguments in one function. Select one address or exact target_name; returns names, types, locations, and pagination."
+        description = "List Hex-Rays locals and arguments in one function. Select one address or exact target_name; returns names, types, locations, opaque edit locators when available, and pagination."
     )]
     async fn list_lvars(
         &self,
@@ -4449,7 +4449,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Persistently rename one Hex-Rays local variable. Select an exact function target and the exact, unique lvar_name from list_lvars. Returns the old variable and resolved target; save_idb writes the database to disk."
+        description = "Persistently rename one Hex-Rays local variable. Select an exact function and one local: lvar_locator from list_lvars (preferred) or an exact lvar_name. Returns the old variable and resolved target; save_idb writes the database to disk."
     )]
     async fn rename_lvar(
         &self,
@@ -4461,15 +4461,13 @@ impl IdaMcpServer {
             "target_name"
         ));
         let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        let selector = try_param!(crate::ida::handlers::lvars::local_selector(
+            req.lvar_name,
+            req.lvar_locator
+        ));
         match self
             .worker
-            .rename_lvar(
-                addr,
-                req.target_name,
-                req.lvar_name,
-                req.new_name,
-                Some(timeout),
-            )
+            .rename_lvar(addr, req.target_name, selector, req.new_name, Some(timeout))
             .await
         {
             Ok(result) => Ok(typed_result(&result)),
@@ -4478,7 +4476,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Persistently set one Hex-Rays local variable's C type. Select an exact function target and exact, unique lvar_name from list_lvars. Rejects invalid or incompatible types; save_idb writes the database to disk."
+        description = "Persistently set one Hex-Rays local variable's C type. Select an exact function and one local: lvar_locator from list_lvars (preferred) or an exact lvar_name. Rejects invalid or incompatible types; save_idb writes the database to disk."
     )]
     async fn set_lvar_type(
         &self,
@@ -4490,15 +4488,13 @@ impl IdaMcpServer {
             "target_name"
         ));
         let timeout = try_param!(lvar_timeout(req.timeout_secs));
+        let selector = try_param!(crate::ida::handlers::lvars::local_selector(
+            req.lvar_name,
+            req.lvar_locator
+        ));
         match self
             .worker
-            .set_lvar_type(
-                addr,
-                req.target_name,
-                req.lvar_name,
-                req.decl,
-                Some(timeout),
-            )
+            .set_lvar_type(addr, req.target_name, selector, req.decl, Some(timeout))
             .await
         {
             Ok(result) => Ok(typed_result(&result)),
@@ -8177,6 +8173,7 @@ mod tests {
             name: "v1".into(),
             type_name: "int".into(),
             location: "w0".into(),
+            locator: Some("opaque-local-locator".into()),
             definition_address: None,
             size: Some(4),
             is_argument: true,
@@ -9579,7 +9576,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "07c13372097a22c8e63ada4bf62c51c684fbb8a89262b0ca16499956126486e6"
+            "0fed4e57b38d78a10347111b1e9e9eae1aec07b36b39f83965a04ad5ce3aca3b"
         );
     }
 

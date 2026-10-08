@@ -165,7 +165,7 @@ pub enum IdaRequest {
     RenameLvar {
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         new_name: String,
         admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<RenameLvarResult, ToolError>>,
@@ -173,7 +173,7 @@ pub enum IdaRequest {
     SetLvarType {
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         decl: String,
         admission: SideEffectAdmission,
         resp: oneshot::Sender<Result<SetLvarTypeResult, ToolError>>,

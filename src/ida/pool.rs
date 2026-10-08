@@ -2784,15 +2784,20 @@ impl WorkspaceDatabase {
         &self,
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         new_name: String,
         timeout_secs: Option<u64>,
     ) -> Result<RenameLvarResult, ToolError> {
+        let (lvar_name, lvar_locator) = match selector {
+            LocalVariableSelector::Name(name) => (Some(name), None),
+            LocalVariableSelector::Locator(locator) => (None, Some(locator)),
+        };
         self.call_json(
             "rename_lvar",
             json!({
                 "address": addr.map(remote::hex_addr), "target_name": name,
-                "lvar_name": lvar_name, "new_name": new_name, "timeout_secs": timeout_secs,
+                "lvar_name": lvar_name, "lvar_locator": lvar_locator,
+                "new_name": new_name, "timeout_secs": timeout_secs,
             }),
             timeout_secs,
             None,
@@ -2804,15 +2809,20 @@ impl WorkspaceDatabase {
         &self,
         addr: Option<u64>,
         name: Option<String>,
-        lvar_name: String,
+        selector: LocalVariableSelector,
         decl: String,
         timeout_secs: Option<u64>,
     ) -> Result<SetLvarTypeResult, ToolError> {
+        let (lvar_name, lvar_locator) = match selector {
+            LocalVariableSelector::Name(name) => (Some(name), None),
+            LocalVariableSelector::Locator(locator) => (None, Some(locator)),
+        };
         self.call_json(
             "set_lvar_type",
             json!({
                 "address": addr.map(remote::hex_addr), "target_name": name,
-                "lvar_name": lvar_name, "decl": decl, "timeout_secs": timeout_secs,
+                "lvar_name": lvar_name, "lvar_locator": lvar_locator,
+                "decl": decl, "timeout_secs": timeout_secs,
             }),
             timeout_secs,
             None,

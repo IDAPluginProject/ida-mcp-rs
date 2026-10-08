@@ -1165,7 +1165,7 @@ dependencies = [
 [[package]]
 name = "idalib"
 version = "0.7.6+9.5.261001"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#a4432f21e8e4842a013b9c6d5586b8e1b1ef8375"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#159cedb7f8c7b515480f0bb4e60b92df75f3b831"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1179,7 +1179,7 @@ dependencies = [
 [[package]]
 name = "idalib-build"
 version = "0.7.6+9.5.261001"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#a4432f21e8e4842a013b9c6d5586b8e1b1ef8375"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#159cedb7f8c7b515480f0bb4e60b92df75f3b831"
 dependencies = [
  "anyhow",
  "idalib-sys",
@@ -1188,7 +1188,7 @@ dependencies = [
 [[package]]
 name = "idalib-sys"
 version = "0.7.6+9.5.261001"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#a4432f21e8e4842a013b9c6d5586b8e1b1ef8375"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.5#159cedb7f8c7b515480f0bb4e60b92df75f3b831"
 dependencies = [
  "anyhow",
  "autocxx",

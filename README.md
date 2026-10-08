@@ -238,14 +238,18 @@ whether the change succeeded.
 
 For Hex-Rays locals and arguments, use `list_lvars` with one function address
 or exact `target_name`. `rename_lvar` and `set_lvar_type` take the same function
-selector plus an exact, unique `lvar_name`. They return the variable as it was
-before the edit and the resolved function target. The edits appear in subsequent
-decompilations; use `save_idb` to checkpoint them to disk.
+selector plus exactly one of `lvar_locator` or `lvar_name`. Prefer the opaque
+`locator` returned by `list_lvars`: display names such as `v1` can move to a
+different local after a prototype change. A stale or ambiguous locator fails
+without making a change. Locals without a locator are edited by exact, unique
+name.
+The tools return the variable as it was before the edit and the resolved
+function target. Use `save_idb` to checkpoint edits to disk.
 
 ```text
 list_lvars(target_name: "interesting_function")
-rename_lvar(target_name: "interesting_function", lvar_name: "v1", new_name: "count")
-set_lvar_type(target_name: "interesting_function", lvar_name: "count", decl: "unsigned int")
+rename_lvar(target_name: "interesting_function", lvar_locator: "<locator from list_lvars>", new_name: "count")
+set_lvar_type(target_name: "interesting_function", lvar_locator: "<locator from list_lvars>", decl: "unsigned int")
 save_idb()
 ```
 

@@ -424,11 +424,16 @@ pub struct RenameLvarRequest {
     #[serde(alias = "function_name")]
     pub target_name: Option<String>,
     #[schemars(
-        description = "Exact, unique local name from list_lvars",
+        description = "Exact, unique current local name (alternative to lvar_locator)",
         length(min = 1, max = 1024)
     )]
     #[serde(alias = "old_name")]
-    pub lvar_name: String,
+    pub lvar_name: Option<String>,
+    #[schemars(
+        description = "Opaque locator from list_lvars (preferred: display names can move to another local after reanalysis). Pass exactly one of lvar_locator or lvar_name.",
+        length(min = 1, max = 16384)
+    )]
+    pub lvar_locator: Option<String>,
     #[schemars(description = "New local variable name", length(min = 1, max = 1024))]
     pub new_name: String,
     #[schemars(
@@ -449,10 +454,15 @@ pub struct SetLvarTypeRequest {
     #[serde(alias = "function_name")]
     pub target_name: Option<String>,
     #[schemars(
-        description = "Exact, unique local name from list_lvars",
+        description = "Exact, unique current local name (alternative to lvar_locator)",
         length(min = 1, max = 1024)
     )]
-    pub lvar_name: String,
+    pub lvar_name: Option<String>,
+    #[schemars(
+        description = "Opaque locator from list_lvars (preferred: display names can move to another local after reanalysis). Pass exactly one of lvar_locator or lvar_name.",
+        length(min = 1, max = 16384)
+    )]
+    pub lvar_locator: Option<String>,
     #[schemars(
         description = "C type declaration, for example unsigned int",
         length(min = 1, max = 16384)

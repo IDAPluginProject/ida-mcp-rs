@@ -475,6 +475,9 @@ pub struct LocalVariableInfo {
     pub name: String,
     pub type_name: String,
     pub location: String,
+    /// Opaque SDK identity; prefer it over a display name when editing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -482,6 +485,11 @@ pub struct LocalVariableInfo {
     pub is_argument: bool,
     pub has_user_name: bool,
     pub has_user_type: bool,
+}
+
+pub enum LocalVariableSelector {
+    Name(String),
+    Locator(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

@@ -1059,7 +1059,7 @@ pub fn run_ida_loop(
             IdaRequest::RenameLvar {
                 addr,
                 name,
-                lvar_name,
+                selector,
                 new_name,
                 admission,
                 resp,
@@ -1074,7 +1074,7 @@ pub fn run_ida_loop(
                             name: name.as_deref(),
                             offset: 0,
                         },
-                        &lvar_name,
+                        &selector,
                         &new_name,
                     )
                 });
@@ -1083,7 +1083,7 @@ pub fn run_ida_loop(
             IdaRequest::SetLvarType {
                 addr,
                 name,
-                lvar_name,
+                selector,
                 decl,
                 admission,
                 resp,
@@ -1098,7 +1098,7 @@ pub fn run_ida_loop(
                             name: name.as_deref(),
                             offset: 0,
                         },
-                        &lvar_name,
+                        &selector,
                         &decl,
                     )
                 });

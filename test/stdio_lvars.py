@@ -174,6 +174,8 @@ def exercise(binary, fixture, workspace):
             assert listing["target"]["address"] == address, listing
             variables = listing["lvars"]
             assert len(variables) == listing["total"] and variables, listing
+            locators = [v["locator"] for v in variables]
+            assert len(set(locators)) == len(locators), variables
             first_page = decode(client.call("list_lvars", {**target, "limit": 1}))
             assert first_page["lvars"] == variables[:1]
             if len(variables) > 1:
@@ -181,6 +183,7 @@ def exercise(binary, fixture, workspace):
             variable = next((v for v in variables if v.get("size") == 4 and not v["is_argument"]),
                             next(v for v in variables if v.get("size") == 4))
             old_name = variable["name"]
+            locator = variable["locator"]
             new_name = "mcp_lvar_checked_value"
             change = {**target, "lvar_name": old_name}
             rejected(client.call("rename_lvar", {**change, "new_name": ""}))
@@ -200,6 +203,17 @@ def exercise(binary, fixture, workspace):
             listing = decode(client.call("list_lvars", {"address": address, "limit": 1000}))
             current = next(v for v in listing["lvars"] if v["name"] == new_name)
             assert current["has_user_name"], current
+            assert current["locator"] == locator, (current, variable)
+
+            other_function = decode(client.call("resolve_function", {"name": "helper_mix"}))
+            rejected(client.call("rename_lvar", {"address": other_function["address"],
+                                                 "lvar_locator": locator,
+                                                 "new_name": "must_not_change"}), "stale")
+            # Reuse the old display name for another actual Hex-Rays local.
+            # The locator edit below must never follow that reused name.
+            other = next(v for v in listing["lvars"] if v["locator"] != locator)
+            decode(client.call("rename_lvar", {**target, "lvar_locator": other["locator"],
+                                               "new_name": old_name}))
             rejected(client.call("set_lvar_type", {**target, "lvar_name": new_name,
                                                      "decl": "this is not a C type !!!"}),
                      "could not parse")
@@ -207,8 +221,9 @@ def exercise(binary, fixture, workspace):
                      "does not accept")
             assert next(v for v in decode(client.call("list_lvars", {**target, "limit": 1000}))["lvars"]
                         if v["name"] == new_name)["type_name"] == current["type_name"]
-            typed = decode(client.call("set_lvar_type", {"address": address, "lvar_name": new_name,
-                                                         "decl": "unsigned int"}))
+            # Width is not part of the identity: a narrower type keeps the locator.
+            typed = decode(client.call("set_lvar_type", {"address": address, "lvar_locator": locator,
+                                                         "decl": "unsigned __int16"}))
             assert typed["applied"] and typed["variable"]["name"] == new_name, typed
             assert new_name in decode(client.call("decompile", {"address": address}))
             decode(client.call("save_idb", {}))
@@ -218,6 +233,7 @@ def exercise(binary, fixture, workspace):
             persisted = next(v for v in persisted["lvars"] if v["name"] == new_name)
             assert persisted["has_user_name"] and persisted["has_user_type"], persisted
             assert persisted["type_name"] == typed["type_name"], (persisted, typed)
+            assert persisted["locator"] == locator and persisted["size"] == 2, persisted
             client.close_database()
         except BaseException:
             print(client.log_path.read_text(encoding="utf-8", errors="replace"))
