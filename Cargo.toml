@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "9.5.0-beta.5"
+version = "9.5.0-beta.6"
 edition = "2024"
 rust-version = "1.89"
 description = "Headless IDA Pro MCP Server"
