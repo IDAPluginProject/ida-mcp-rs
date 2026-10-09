@@ -1,12 +1,35 @@
 """Exercise exact native pseudocode comment placement and persistence."""
 
 import argparse
+import platform
 import re
 import shutil
 import tempfile
 from pathlib import Path
 
 from stdio_lvars import Client, decode, rejected
+
+
+def check_shared_slot(client):
+    """One `stp xzr, xzr` renders as two statements sharing one comment slot.
+
+    Hex-Rays prints a shared slot's comment once, on the first such line, so
+    only that line is listed and a comment set through it renders there.
+    """
+    function = decode(client.call("resolve_function", {"name": "clear_pair"}))
+    target = {"target_name": function["name"]}
+    stores = [line.strip() for line in
+              decode(client.call("decompile", {"address": function["address"]})).splitlines()
+              if line.strip().endswith("= 0;")]
+    assert len(stores) == 2, stores
+    rows = decode(client.call("list_pseudocode_comments", target))["locations"]
+    listed = [row for row in rows if row["text"].strip() in stores]
+    assert [row["text"].strip() for row in listed] == stores[:1], rows
+    decode(client.call("set_pseudocode_comment", {
+        **target, "comment_locator": listed[0]["locator"], "comment": "issue62 shared"}))
+    pseudocode = decode(client.call("decompile", {"address": function["address"]}))
+    commented = [line.strip() for line in pseudocode.splitlines() if "issue62 shared" in line]
+    assert len(commented) == 1 and commented[0].startswith(stores[0]), pseudocode
 
 
 def exercise(binary, fixture, workspace):
@@ -49,6 +72,9 @@ def exercise(binary, fixture, workspace):
             rejected(write(alternative, "wrong function", target_name=other["name"]), "stale")
             rejected(write(alternative, "stale", comment_locator=alternative["locator"] + "0"), "stale")
             assert locations() == initial
+
+            if platform.machine().lower() in ("arm64", "aarch64"):
+                check_shared_slot(client)
 
             decode(write(condition, "issue62 condition"))
             decode(write(alternative, "issue62 old alternative\nsecond line"))
