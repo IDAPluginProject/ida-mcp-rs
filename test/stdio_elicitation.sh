@@ -148,7 +148,8 @@ start_server() {
   # Keep JSON-RPC stdout separate from tracing stderr: with `2>&1` both
   # writers share one file offset, and a trace line flushed mid-response
   # tears the response line in the log, wedging the wait loops until timeout.
-  RUST_LOG="${RUST_LOG:-ida_mcp=trace}" "$BIN" <"$fifo_in" >"$log" 2>"$errlog" &
+  # Create the logs before the FIFO open blocks: the wait loops read $log at once.
+  RUST_LOG="${RUST_LOG:-ida_mcp=trace}" "$BIN" >"$log" 2>"$errlog" <"$fifo_in" &
   server_pid=$!
   exec 3>"$fifo_in"
 }
