@@ -86,6 +86,7 @@ pub mod ida;
 pub mod macho_fat;
 pub mod server;
 pub mod tool_registry;
+pub mod transport;
 
 pub use error::ToolError;
 pub use ida::{

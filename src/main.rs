@@ -17,6 +17,7 @@ use ida_mcp::server::http_config::{
 use ida_mcp::server::task::TaskRegistry;
 use ida_mcp::server::tool_filter::{self, ToolFilter};
 use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
+use ida_mcp::transport::{supervised_stdio, worker_stdio};
 use ida_mcp::{
     disasm::generate_disasm_line,
     expand_path, ida,
@@ -25,7 +26,6 @@ use ida_mcp::{
     FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
 };
 use idalib::{idb::IDBOpenOptions, Address, IDB};
-use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::ServiceExt;
 use std::ffi::OsString;
@@ -462,11 +462,22 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
 async fn shutdown_supervised(
     pool: &WorkerPool,
     tasks: &TaskRegistry,
+    drain: impl std::future::Future<Output = ()>,
     close: impl std::future::Future<Output = Result<(), ida_mcp::error::ToolError>>,
 ) {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+    // A request waiting on a client can outlive an idle IDA worker. Reserve
+    // time to save that worker while keeping the total shutdown bound fixed.
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
+    let started = tokio::time::Instant::now();
+    pool.begin_drain();
+    if tokio::time::timeout(DRAIN_TIMEOUT, drain).await.is_err() {
+        warn!("MCP requests did not settle before the shutdown drain deadline");
+    }
     pool.begin_shutdown().await;
     tokio::pin!(close);
-    match tokio::time::timeout(Duration::from_secs(120), &mut close).await {
+    let remaining = SHUTDOWN_TIMEOUT.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, &mut close).await {
         Ok(Ok(())) | Ok(Err(ida_mcp::error::ToolError::NoDatabaseOpen)) => {}
         Ok(Err(error)) => warn!(%error, "IDA database close failed during shutdown"),
         Err(_) => warn!("IDA database close timed out during shutdown; retiring the child"),
@@ -524,13 +535,15 @@ fn run_server(
         }
         let server = IdaMcpServer::with_filter(backend, ServerMode::Stdio, filter.clone());
         let task_registry = server.task_registry().clone();
-        // EOF drops rmcp's handler. Retain its task lifetime through saving.
+        // Retain the handler's task lifetime through save-first shutdown.
         let server_lifetime = server.clone();
         let sanitized = SanitizedIdaServer::with_filter(server, filter);
+        let (transport, stdio_shutdown) = supervised_stdio();
         let mut service = sanitized
-            .serve(stdio())
+            .serve(transport)
             .await
             .map_err(|error| anyhow::anyhow!("stdio MCP negotiation failed: {error}"))?;
+        stdio_shutdown.arm();
 
         let shutdown = tokio_util::sync::CancellationToken::new();
         let shutdown_signal = shutdown.clone();
@@ -542,10 +555,13 @@ fn run_server(
         });
         loop {
             tokio::select! {
+                () = stdio_shutdown.closed() => break,
                 _ = shutdown.cancelled() => {
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    // An internal rmcp task failure can close its channel
+                    // without a terminal read/write event on our transport.
                     if service.is_transport_closed() {
                         break;
                     }
@@ -553,7 +569,14 @@ fn run_server(
             }
         }
         info!("MCP server shutting down");
-        shutdown_supervised(&pool, &task_registry, database.close()).await;
+        shutdown_supervised(
+            &pool,
+            &task_registry,
+            stdio_shutdown.drain(),
+            database.close(),
+        )
+        .await;
+        stdio_shutdown.release();
         let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
         drop(server_lifetime);
         info!("Server stopped");
@@ -591,10 +614,12 @@ fn run_server_workspace(
         let task_registry = server.task_registry().clone();
         let server_lifetime = server.clone();
         let sanitized = SanitizedIdaServer::with_workspace(server, filter);
+        let (transport, stdio_shutdown) = supervised_stdio();
         let mut service = sanitized
-            .serve(stdio())
+            .serve(transport)
             .await
             .map_err(|error| anyhow::anyhow!("stdio MCP negotiation failed: {error}"))?;
+        stdio_shutdown.arm();
 
         let shutdown = tokio_util::sync::CancellationToken::new();
         let shutdown_signal = shutdown.clone();
@@ -606,21 +631,24 @@ fn run_server_workspace(
         });
         loop {
             tokio::select! {
+                () = stdio_shutdown.closed() => break,
                 _ = shutdown.cancelled() => {
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    // Also detect rmcp task failures without transport EOF.
                     if service.is_transport_closed() {
                         break;
                     }
                 }
             }
         }
-        shutdown_supervised(&pool, &task_registry, async {
+        shutdown_supervised(&pool, &task_registry, stdio_shutdown.drain(), async {
             registry.shutdown().await;
             Ok(())
         })
         .await;
+        stdio_shutdown.release();
         let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
         drop(server_lifetime);
         Ok::<_, anyhow::Error>(())
@@ -663,7 +691,7 @@ fn run_worker_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Res
             let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
             let sanitized = sanitized.reporting_sdk_crashes(sdk_crash_for_server);
-            let mut service = match sanitized.serve(stdio()).await {
+            let mut service = match sanitized.serve(worker_stdio()).await {
                 Ok(running) => Some(running),
                 Err(e) => {
                     // rmcp fails the serve future without answering the client
@@ -907,7 +935,13 @@ fn run_server_http(
         };
         stop_accepting.cancel();
         let shutdown = async {
-            shutdown_supervised(&pool, &task_registry, database.close()).await;
+            shutdown_supervised(
+                &pool,
+                &task_registry,
+                std::future::ready(()),
+                database.close(),
+            )
+            .await;
             cancel.cancel();
         };
         let serve_result = match serve_result {
@@ -1440,9 +1474,35 @@ fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
+    use crate::{shutdown_supervised, Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
     use clap::Parser;
+    use ida_mcp::ida::pool::{WorkerPool, WorkerPoolConfig};
+    use ida_mcp::server::task::TaskRegistry;
     use std::ffi::OsString;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_request_drain_leaves_time_to_save() {
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: 1,
+            min_workers: 0,
+            worker_idle_timeout: Duration::ZERO,
+            worker_op_timeout: Duration::from_secs(1800),
+            exe_path: std::env::current_exe().expect("test executable"),
+            worker_args: Vec::new(),
+        });
+        let tasks = TaskRegistry::new();
+        let started = tokio::time::Instant::now();
+        let mut saved = false;
+        shutdown_supervised(&pool, &tasks, std::future::pending(), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            saved = true;
+            Ok(())
+        })
+        .await;
+        assert!(saved, "the request drain used the entire save budget");
+        assert_eq!(started.elapsed(), Duration::from_secs(95));
+    }
 
     #[test]
     fn http_session_keep_alive_default_is_thirty_minutes() {

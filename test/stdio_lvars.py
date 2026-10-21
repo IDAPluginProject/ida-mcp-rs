@@ -38,7 +38,7 @@ def rejected(response, expected=None):
 
 
 class Client:
-    def __init__(self, binary, directory, args=()):
+    def __init__(self, binary, directory, args=(), capabilities=None):
         self.log_path = directory / "server.log"
         self.log = self.log_path.open("w", encoding="utf-8")
         try:
@@ -66,7 +66,7 @@ class Client:
         self.reader = threading.Thread(target=read, daemon=True)
         self.reader.start()
         try:
-            self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+            self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": capabilities or {},
                                          "clientInfo": {"name": "lvar-test", "version": "1"}})
             self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         except BaseException:

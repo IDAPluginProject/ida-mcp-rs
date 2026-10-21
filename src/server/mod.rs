@@ -3352,6 +3352,11 @@ impl IdaMcpServer {
         let elicitation_timeout_secs =
             Self::open_idb_elicitation_timeout_secs(prompts.timeout_secs);
         let client_cancel = ctx.ct.clone();
+        let shutdown = ctx
+            .extensions
+            .get::<crate::transport::PendingStdioRequest>()
+            .map(crate::transport::PendingStdioRequest::shutdown_token)
+            .unwrap_or_default();
         let elicitation = ctx.peer.elicit_with_timeout::<OpenIdbBackgroundChoice>(
             prompt,
             Some(Duration::from_secs(elicitation_timeout_secs)),
@@ -3359,6 +3364,9 @@ impl IdaMcpServer {
 
         let result = tokio::select! {
             biased;
+            _ = shutdown.cancelled() => {
+                return Err(McpError::internal_error("server is shutting down", None));
+            }
             _ = client_cancel.cancelled() => {
                 info!(
                     path,
@@ -3550,11 +3558,17 @@ impl IdaMcpServer {
             return Err(NO_FORM_SUPPORT.to_string());
         }
         let timeout_secs = Self::open_idb_elicitation_timeout_secs(request_timeout_secs);
+        let shutdown = ctx
+            .extensions
+            .get::<crate::transport::PendingStdioRequest>()
+            .map(crate::transport::PendingStdioRequest::shutdown_token)
+            .unwrap_or_default();
         let elicitation = ctx
             .peer
             .create_elicitation_with_timeout(form, Some(Duration::from_secs(timeout_secs)));
         let result = tokio::select! {
             biased;
+            _ = shutdown.cancelled() => return Err("the server is shutting down".to_string()),
             _ = ctx.ct.cancelled() => return Err("the request was cancelled".to_string()),
             result = elicitation => result,
         };
@@ -6801,13 +6815,44 @@ impl IdaMcpServer {
         ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<RunScriptRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let timeout = try_param!(parse_optional_unsigned::<u64>(
+            req.timeout_secs,
+            "timeout_secs"
+        ))
+        .unwrap_or(120)
+        .min(MAX_TIMEOUT_SECS);
         let code = match (req.code, req.file) {
             (Some(code), None) => code,
             (None, Some(path)) => {
                 if !Self::validate_path(&path) {
                     return Ok(ToolError::InvalidPath(path).to_tool_result());
                 }
-                match std::fs::read_to_string(&path) {
+                let read =
+                    tokio::time::timeout(Duration::from_secs(timeout), read_script_file(&path));
+                let contents = tokio::select! {
+                    _ = ctx.ct.cancelled() => Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted, "script file read was cancelled",
+                    )),
+                    contents = read => {
+                        contents.unwrap_or_else(|_| Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut, "script file read timed out",
+                        )))
+                    }
+                };
+                let contents = match contents {
+                    Ok(contents) if contents.len() > crate::transport::MAX_MESSAGE_BYTES => {
+                        return Ok(ToolError::InvalidParams(format!(
+                            "script file exceeds the {} MCP message limit",
+                            crate::transport::message_limit_label()
+                        ))
+                        .to_tool_result());
+                    }
+                    Ok(contents) => String::from_utf8(contents).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    }),
+                    Err(error) => Err(error),
+                };
+                match contents {
                     Ok(contents) => contents,
                     Err(e) => {
                         return Ok(ToolError::InvalidPath(format!(
@@ -6831,12 +6876,6 @@ impl IdaMcpServer {
                 .to_tool_result());
             }
         };
-        let timeout = try_param!(parse_optional_unsigned::<u64>(
-            req.timeout_secs,
-            "timeout_secs"
-        ))
-        .unwrap_or(120)
-        .min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(Some(timeout), 120);
         match self
             .run_foreground_operation(
@@ -6893,6 +6932,30 @@ impl IdaMcpServer {
 const RUN_SCRIPT_PREVIEW_CHARS: usize = 220;
 const RUN_SCRIPT_TAIL_LINES: usize = 12;
 const RUN_SCRIPT_TAIL_CHARS: usize = 1600;
+
+async fn read_script_file(path: &str) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    // The path can be replaced after validate_path. A FIFO must not strand
+    // an unabortable blocking-pool task in open() before we can inspect it.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "script path is not a regular file",
+        ));
+    }
+    let max = u64::try_from(crate::transport::MAX_MESSAGE_BYTES).map_err(std::io::Error::other)?;
+    let mut contents = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut contents)
+        .await?;
+    Ok(contents)
+}
 
 fn run_script_succeeded(result: &Value) -> bool {
     result.get("success").and_then(Value::as_bool) == Some(true)
@@ -7872,6 +7935,13 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // rmcp may drop its argument context before polling handlers that do
+        // not take RequestContext. Keep the receive-side guard until the whole
+        // tool call settles, including close_idb and other context-free tools.
+        let _stdio_request = ctx
+            .extensions
+            .get::<crate::transport::PendingStdioRequest>()
+            .cloned();
         if tool_registry::get_tool(&params.name).is_some() && !self.filter.is_enabled(&params.name)
         {
             return Err(McpError::invalid_params(
@@ -7888,7 +7958,12 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
             ));
         }
         let tool = params.name.to_string();
-        let response = self.inner.call_tool(params, ctx).await;
+        let mut response = self.inner.call_tool(params, ctx).await;
+        if self.sdk_crash.is_none()
+            && let Ok(CallToolResponse::Complete(result)) = &mut response
+        {
+            crate::ida::remote::strip_result_metadata(result);
+        }
         if !self.sdk_crash.as_ref().is_some_and(|signal| signal.take()) {
             return response;
         }
@@ -8053,6 +8128,85 @@ mod tests {
             Arc::new(crate::IdaWorker::new(tx)),
             crate::ServerMode::Stdio,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_script_fifo_is_rejected_without_waiting_for_a_writer() {
+        let path = std::env::temp_dir().join(format!("ida-mcp-script-{}", uuid::Uuid::new_v4()));
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("create FIFO")
+            .success());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::server::read_script_file(path.to_str().expect("UTF-8 fixture path")),
+        )
+        .await;
+        std::fs::remove_file(&path).expect("remove owned FIFO");
+        let error = result
+            .expect("FIFO open must not block")
+            .expect_err("reject FIFO");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn private_worker_metadata_is_removed_only_at_the_public_boundary() {
+        use rmcp::model::{CallToolRequestParams, ClientConfig, ServerCapabilities, ServerConfig};
+        use rmcp::service::{RequestContext, RoleServer};
+        use rmcp::{ErrorData, ServiceExt as _};
+
+        struct MetadataServer;
+        impl ServerHandler for MetadataServer {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+
+            async fn call_tool(
+                &self,
+                _params: CallToolRequestParams,
+                _ctx: RequestContext<RoleServer>,
+            ) -> Result<CallToolResponse, ErrorData> {
+                let mut result = CallToolResult::success(vec![]);
+                result.meta = Some(
+                    serde_json::from_value(json!({
+                        "ida-mcp/sdk-crashed": true,
+                        "public": "retained"
+                    }))
+                    .expect("metadata"),
+                );
+                Ok(CallToolResponse::Complete(result))
+            }
+        }
+
+        for worker in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let mut server = crate::server::SanitizedIdaServer::new(MetadataServer);
+            if worker {
+                server =
+                    server.reporting_sdk_crashes(crate::crash_guard::SdkCrashSignal::default());
+            }
+            let serving = tokio::spawn(async move { server.serve(server_io).await });
+            let mut client = ClientConfig::default()
+                .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+                .serve(client_io)
+                .await
+                .expect("client handshake");
+            let mut server = serving
+                .await
+                .expect("server task")
+                .expect("server handshake");
+            let result = client
+                .call_tool(CallToolRequestParams::new("metadata_probe"))
+                .await
+                .expect("tool response");
+            let meta = result.meta.expect("public metadata remains");
+            assert_eq!(meta.0.get("public"), Some(&json!("retained")));
+            assert_eq!(meta.0.contains_key("ida-mcp/sdk-crashed"), worker);
+            client.close().await.expect("close client");
+            server.close().await.expect("close server");
+        }
     }
 
     /// One-result tools refuse several addresses instead of answering for the
@@ -9950,24 +10104,42 @@ mod tests {
 
     #[test]
     fn tool_error_is_a_completed_task_result_not_a_json_rpc_failure() {
-        let registry = crate::server::task::TaskRegistry::new();
-        let id = registry
-            .create_keyed(&TASK_OWNER, "dsc", "tool-error", "Opening DSC")
-            .expect("create task");
-        let error_result =
-            ToolError::OpenFailed("idat exited with code 4".to_string()).to_tool_result();
-        registry.complete(&id, call_tool_result_to_value(&error_result));
-
-        let state = registry.get(&id).expect("task state");
-        let value =
-            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
-
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["result"]["isError"], true);
-        assert!(value["result"]["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("idat exited with code 4")));
-        assert!(value.get("error").is_none());
+        for (error, message) in [
+            (
+                ToolError::OpenFailed("idat exited with code 4".into()),
+                "idat exited with code 4",
+            ),
+            (
+                ToolError::RemoteCall(rmcp::ErrorData::invalid_params(
+                    "request rejected",
+                    Some(json!({"private": "worker-private-data"})),
+                )),
+                "request rejected",
+            ),
+        ] {
+            let registry = crate::server::task::TaskRegistry::new();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "dsc", "tool-error", "Opening DSC")
+                .expect("create task");
+            IdaMcpServer::complete_background_tool_error(
+                &id,
+                &registry,
+                &error,
+                &tokio_util::sync::CancellationToken::new(),
+                "Cancelled after work settled",
+            );
+            let state = registry.get(&id).expect("task state");
+            let value =
+                serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
+            assert_eq!(value["status"], "completed");
+            assert_eq!(value["result"]["isError"], true);
+            assert!(value["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(message)));
+            assert!(value.get("error").is_none());
+            assert!(value["result"].get("_meta").is_none());
+            assert!(!value.to_string().contains("worker-private-data"));
+        }
     }
 
     #[test]

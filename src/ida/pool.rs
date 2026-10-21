@@ -13,7 +13,7 @@ use crate::ida::worker::{
 };
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CallToolResult, JsonObject};
+use rmcp::model::{CallToolResult, ClientConfig, JsonObject, ProtocolVersion};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
@@ -64,6 +64,7 @@ pub struct WorkerPool {
     inner: Arc<Mutex<PoolInner>>,
     config: Arc<WorkerPoolConfig>,
     shutdown: CancellationToken,
+    stop_queued_calls: CancellationToken,
     shutdown_lock: Arc<Mutex<()>>,
     startups: TaskTracker,
     startup_timeout: Duration,
@@ -176,7 +177,11 @@ pub struct PooledWorkerHandle {
 #[derive(Clone)]
 struct ParentClientHandler;
 
-impl ClientHandler for ParentClientHandler {}
+impl ClientHandler for ParentClientHandler {
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default().with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum WorkerRetireReason {
@@ -369,6 +374,7 @@ impl WorkerPool {
             })),
             config: Arc::new(config),
             shutdown: CancellationToken::new(),
+            stop_queued_calls: CancellationToken::new(),
             shutdown_lock: Arc::new(Mutex::new(())),
             startups: TaskTracker::new(),
             startup_timeout: CHILD_STARTUP_TIMEOUT,
@@ -688,7 +694,15 @@ impl WorkerPool {
                 self.mark_dead_for_lease(&handle.slot, handle.lease_id)
                     .await;
                 release_guard.disarm();
-                return Err(err);
+                return Err(match err {
+                    ToolError::RemoteCall(error) => ToolError::WorkerRetired(format!(
+                        "close_idb returned a protocol error ({}: {}), so its save could not be \
+                         confirmed. The worker was retired; its database is no longer open and \
+                         changes since the last save_idb may be lost",
+                        error.code.0, error.message
+                    )),
+                    error => error,
+                });
             }
             other => other,
         };
@@ -890,8 +904,15 @@ impl WorkerPool {
         }
     }
 
+    /// Reject calls waiting for a busy worker while allowing already-received
+    /// requests to use an idle worker during the public transport drain.
+    pub fn begin_drain(&self) {
+        self.stop_queued_calls.cancel();
+    }
+
     /// Stop admission without cancelling operations that may still need saving.
     pub async fn begin_shutdown(&self) {
+        self.begin_drain();
         let mut inner = self.inner.lock().await;
         inner.shutting_down = true;
         self.shutdown.cancel();
@@ -1076,7 +1097,18 @@ impl PooledWorkerHandle {
         let admitted = Instant::now();
         let tracks_open = open_dispatch.is_some();
         let admission = async {
-            let call_guard = self.slot.call_lock.lock().await;
+            // During drain only contention with another native call rejects
+            // admission. An idle worker may briefly hold its state mutex while
+            // reporting status; that must not reject a pipelined save.
+            let call_guard = tokio::select! {
+                biased;
+                guard = self.slot.call_lock.lock() => guard,
+                _ = self.pool.stop_queued_calls.cancelled() => {
+                    return Err(ToolError::NeverDispatched(format!(
+                        "{tool} was not dispatched because the server is shutting down"
+                    )));
+                }
+            };
             let mut child = self.slot.child.lock().await;
             match &child.state {
                 ChildState::Leased {
@@ -1096,7 +1128,10 @@ impl PooledWorkerHandle {
             // The child mutex, outbound queue, and call lock are all part of
             // admission. In particular, an acquired call lock alone says
             // nothing about whether the child can execute this request.
-            let request = remote::dispatch_tool(&child.peer, tool, args).await;
+            let request = match remote::dispatch_tool(&child.peer, tool, args).await {
+                Err(error) if error.never_dispatched() => return Err(error),
+                result => result,
+            };
             // No await may separate successful dispatch, artifact ownership,
             // and arming retirement: another runtime thread may already be
             // executing the request. A failed send means the transport is
@@ -1117,9 +1152,11 @@ impl PooledWorkerHandle {
         let admission = async {
             let admission = tokio::select! {
                 biased;
-                _ = self.pool.shutdown.cancelled() => return Err(ToolError::NeverDispatched(format!(
-                    "{tool} was not dispatched because the server is shutting down"
-                ))),
+                _ = self.pool.shutdown.cancelled() => {
+                    return Err(ToolError::NeverDispatched(format!(
+                        "{tool} was not dispatched because the server is shutting down"
+                    )));
+                }
                 admitted = tokio::time::timeout(timeout, admission) => admitted,
             };
             admission.map_err(|_| {
@@ -1176,89 +1213,81 @@ impl PooledWorkerHandle {
             tokio::time::timeout(timeout, &mut response).await
         };
 
-        match result {
-            Ok(Ok(result)) => {
-                if let Some(err) = remote::sdk_crash(&result, tool) {
-                    self.pool
-                        .mark_dead_for_lease(&self.slot, self.lease_id)
-                        .await;
-                    retire_guard.disarm();
-                    return Err(err);
-                }
-                if tracks_open
-                    && let Some(err) = remote::result_error(&result, tool)
-                    && unsettled_open_error_retires_worker(&err)
-                {
-                    // A timeout/cancellation response bounds the caller's
-                    // wait, not the native IDA open. Keep the pre-dispatch
-                    // artifact snapshot attached while retirement settles
-                    // the child and cleans only this generation's output.
-                    self.pool
-                        .mark_dead_for_lease(&self.slot, self.lease_id)
-                        .await;
-                    retire_guard.disarm();
-                    return Err(err);
-                }
-                if tracks_open {
-                    let mut child = self.slot.child.lock().await;
-                    if child.state == ChildState::Dead || child.transport_closed() {
-                        drop(child);
-                        self.pool
-                            .mark_dead_for_lease(&self.slot, self.lease_id)
-                            .await;
-                        retire_guard.disarm();
-                        return Err(ToolError::WorkerCrashed {
-                            worker_id: self.worker_id,
-                            last_op: tool.to_string(),
-                        });
-                    }
-                    if !child.state.belongs_to_lease(self.lease_id) {
-                        retire_guard.disarm();
-                        return Err(ToolError::DatabaseReplaced);
-                    }
-                    child.pending_open_artifacts = None;
-                    if result.is_error == Some(true) {
-                        child.idb_path = previous_idb_path;
-                    } else if let Ok(info) = remote::parse_json::<DbInfo>(result.clone(), tool) {
-                        child.idb_path = Some(PathBuf::from(info.path));
-                    }
-                }
-                if let Some(error) = remote::result_error(&result, tool)
-                    && child_tool_error_retires_worker(tool, &error)
-                {
-                    self.pool
-                        .mark_dead_for_lease(&self.slot, self.lease_id)
-                        .await;
-                    retire_guard.disarm();
-                    return Err(error);
-                }
-                retire_guard.disarm();
-                Ok(result)
-            }
+        // A correlated protocol error is a settled reply, just like a tool
+        // result. Transport failure and timeout still retire the worker.
+        let result = match result {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error @ ToolError::RemoteCall(_))) => Err(error),
             Ok(Err(err)) => {
                 self.pool
                     .mark_dead_for_lease(&self.slot, self.lease_id)
                     .await;
                 retire_guard.disarm();
-                Err(ToolError::WorkerCrashed {
+                return Err(ToolError::WorkerCrashed {
                     worker_id: self.worker_id,
                     last_op: format!("{tool}: {err}"),
-                })
+                });
             }
             Err(_) => {
                 self.pool
                     .mark_dead_for_lease(&self.slot, self.lease_id)
                     .await;
                 retire_guard.disarm();
-                Err(ToolError::WorkerRetired(format!(
+                return Err(ToolError::WorkerRetired(format!(
                     "{tool} exceeded worker operation timeout of {} seconds; killed worker {}. \
                      The database it held is no longer open and changes since the last \
                      save_idb are lost; call open_idb again",
                     timeout.as_secs(),
                     self.worker_id
-                )))
+                )));
+            }
+        };
+        if let Ok(reply) = &result {
+            let error = remote::sdk_crash(reply, tool).or_else(|| {
+                remote::result_error(reply, tool).filter(|error| {
+                    (tracks_open && unsettled_open_error_retires_worker(error))
+                        || child_tool_error_retires_worker(tool, error)
+                })
+            });
+            if let Some(error) = error {
+                // An unsettled native open retains its artifact snapshot until
+                // retirement cleans only the output owned by this generation.
+                self.pool
+                    .mark_dead_for_lease(&self.slot, self.lease_id)
+                    .await;
+                retire_guard.disarm();
+                return Err(error);
             }
         }
+        if tracks_open {
+            let mut child = self.slot.child.lock().await;
+            if child.state == ChildState::Dead || child.transport_closed() {
+                drop(child);
+                self.pool
+                    .mark_dead_for_lease(&self.slot, self.lease_id)
+                    .await;
+                retire_guard.disarm();
+                return Err(ToolError::WorkerCrashed {
+                    worker_id: self.worker_id,
+                    last_op: tool.to_string(),
+                });
+            }
+            if !child.state.belongs_to_lease(self.lease_id) {
+                retire_guard.disarm();
+                return Err(ToolError::DatabaseReplaced);
+            }
+            child.pending_open_artifacts = None;
+            match &result {
+                Ok(reply) if reply.is_error != Some(true) => {
+                    if let Ok(info) = remote::parse_json::<DbInfo>(reply.clone(), tool) {
+                        child.idb_path = Some(PathBuf::from(info.path));
+                    }
+                }
+                Ok(_) | Err(_) => child.idb_path = previous_idb_path,
+            }
+        }
+        retire_guard.disarm();
+        result
     }
 }
 
@@ -2037,6 +2066,10 @@ impl WorkspaceDatabase {
         self.handle.try_lock().is_ok_and(|lease| lease.is_none())
     }
 
+    #[allow(
+        deprecated,
+        reason = "AtomicU64::try_update requires Rust 1.95; the MSRV is 1.89"
+    )]
     fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
         let previous = self
             .next_database_generation
@@ -2213,6 +2246,7 @@ impl WorkspaceDatabase {
                 }
             }
             Err(err) if err.never_dispatched() => Err(err),
+            Err(err @ ToolError::RemoteCall(_)) => Err(err),
             Err(err) => {
                 let debug_pinned = self
                     .clear_handle_if_lease(handle.worker_id, generation)
@@ -3886,6 +3920,7 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
             | ToolError::SdkCrashed(_)
             | ToolError::WorkerRetired(_)
             | ToolError::RemoteProtocol(_)
+            | ToolError::RemoteCall(_)
             | ToolError::WorkerClosed
     )
 }

@@ -2,7 +2,8 @@
 
 use crate::error::{ToolError, DEBUGGER_START_RETAINED_PREFIX};
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, JsonObject, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, GetMeta, JsonObject,
+    JsonRpcRequest, ProgressToken, RequestId, ServerResult,
 };
 use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient, ServiceError};
 use serde::de::DeserializeOwned;
@@ -40,14 +41,27 @@ pub(crate) fn mark_sdk_crashed(result: &mut CallToolResult) {
         .insert(SDK_CRASHED_META_KEY.to_string(), Value::Bool(true));
 }
 
-/// The crash a child reported for `tool`, if it marked this result.
-pub(crate) fn sdk_crash(result: &CallToolResult, tool: &str) -> Option<ToolError> {
-    let marked = result
+/// Remove private worker markers after the parent has made its lifecycle decisions.
+pub(crate) fn strip_result_metadata(result: &mut CallToolResult) {
+    if let Some(meta) = &mut result.meta {
+        meta.0.remove(SDK_CRASHED_META_KEY);
+        if meta.0.is_empty() {
+            result.meta = None;
+        }
+    }
+}
+
+pub(crate) fn is_sdk_crash(result: &CallToolResult) -> bool {
+    result
         .meta
         .as_ref()
         .and_then(|meta| meta.0.get(SDK_CRASHED_META_KEY))
-        == Some(&Value::Bool(true));
-    if !marked {
+        == Some(&Value::Bool(true))
+}
+
+/// The crash a child reported for `tool`, if it marked this result.
+pub(crate) fn sdk_crash(result: &CallToolResult, tool: &str) -> Option<ToolError> {
+    if !is_sdk_crash(result) {
         return None;
     }
     let message = if result.is_error == Some(true) {
@@ -208,25 +222,57 @@ pub(crate) async fn dispatch_tool(
     tool: &'static str,
     args: JsonObject,
 ) -> Result<RequestHandle<RoleClient>, ToolError> {
-    peer.send_cancellable_request(
-        ClientRequest::CallToolRequest(CallToolRequest::new(
-            CallToolRequestParams::new(tool).with_arguments(args),
-        )),
-        PeerRequestOptions::no_options(),
-    )
-    .await
-    .map_err(|err| ToolError::RemoteProtocol(format!("{tool} call failed: {err}")))
+    if !peer
+        .peer_info()
+        .is_some_and(|info| info.protocol_version.has_initialize())
+    {
+        return Err(ToolError::NeverDispatched(
+            "private IDA worker requires the initialized MCP protocol".into(),
+        ));
+    }
+    let mut request = ClientRequest::CallToolRequest(CallToolRequest::new(
+        CallToolRequestParams::new(tool).with_arguments(args),
+    ));
+    // The private peer uses legacy initialize and no request options. rmcp
+    // adds a numeric ID and progress token; count their widest i64 encodings.
+    // The real progress token replaces this value during dispatch.
+    request
+        .get_meta_mut()
+        .set_progress_token(ProgressToken(RequestId::Number(i64::MIN)));
+    let frame = JsonRpcRequest::new(RequestId::Number(i64::MIN), &request);
+    if !crate::transport::frame_fits(&frame).map_err(|error| {
+        ToolError::NeverDispatched(format!(
+            "could not encode {tool} for the IDA worker: {error}"
+        ))
+    })? {
+        return Err(ToolError::NeverDispatched(format!(
+            "{tool} request exceeds the {} MCP message limit; the IDA worker was not called",
+            crate::transport::message_limit_label()
+        )));
+    }
+    peer.send_cancellable_request(request, PeerRequestOptions::no_options())
+        .await
+        .map_err(|err| ToolError::RemoteProtocol(format!("{tool} call failed: {err}")))
 }
 
 pub(crate) async fn tool_response(
     request: RequestHandle<RoleClient>,
     tool: &'static str,
 ) -> Result<CallToolResult, ToolError> {
-    match request
-        .await_response()
-        .await
-        .map_err(|err| ToolError::RemoteProtocol(format!("{tool} call failed: {err}")))?
-    {
+    let response = match request.await_response().await {
+        Ok(response) => response,
+        // A correlated MCP error settles this request; it does not mean the
+        // private transport or the worker process has failed.
+        Err(ServiceError::McpError(error)) => {
+            return Err(ToolError::RemoteCall(error));
+        }
+        Err(error) => {
+            return Err(ToolError::RemoteProtocol(format!(
+                "{tool} call failed: {error}"
+            )));
+        }
+    };
+    match response {
         ServerResult::CallToolResult(result) => Ok(result),
         _ => Err(ToolError::RemoteProtocol(format!(
             "{tool} call failed: {}",
@@ -242,6 +288,40 @@ mod tests {
     use crate::ida::types::{MutationTarget, StackVarResult, TargetSelector};
     use rmcp::model::{CallToolResult, ContentBlock as Content};
     use serde_json::{json, Value};
+
+    #[tokio::test]
+    async fn modern_private_peer_is_rejected_before_dispatch() {
+        use rmcp::model::{ClientConfig, ProtocolVersion};
+        use rmcp::service::{ClientLifecycleMode, ClientServiceExt as _};
+        use rmcp::ServiceExt as _;
+
+        struct Server;
+        impl rmcp::ServerHandler for Server {}
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move { Server.serve(server_io).await });
+        let mut client = ClientConfig::default()
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .serve_with_lifecycle(
+                client_io,
+                ClientLifecycleMode::Discover {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                },
+            )
+            .await
+            .expect("modern client discovery");
+        let result = crate::ida::remote::dispatch_tool(
+            client.peer(),
+            "run_script",
+            rmcp::model::JsonObject::new(),
+        )
+        .await;
+        let Err(ToolError::NeverDispatched(_)) = result else {
+            panic!("modern private dispatch must fail before entering the queue");
+        };
+        client.close().await.expect("close client");
+        assert!(serving.await.expect("server task").is_err());
+    }
 
     #[test]
     fn sdk_crash_is_read_from_the_marker_not_the_text() {

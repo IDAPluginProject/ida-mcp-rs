@@ -3,7 +3,7 @@
 //! Tool execution errors are returned with `is_error: true` in CallToolResult,
 //! while protocol errors (invalid tool name, malformed args) are handled by rmcp.
 
-use rmcp::model::{CallToolResult, ContentBlock as Content};
+use rmcp::model::{CallToolResult, ContentBlock as Content, ErrorData};
 use thiserror::Error;
 
 pub(crate) const DEBUGGER_START_RETAINED_PREFIX: &str =
@@ -107,6 +107,10 @@ pub enum ToolError {
     #[error("Remote worker protocol error: {0}")]
     RemoteProtocol(String),
 
+    /// A correlated JSON-RPC error completes one request without losing the worker.
+    #[error("Remote worker rejected request ({}): {}", .0.code.0, .0.message)]
+    RemoteCall(ErrorData),
+
     #[error("IDA error: {0}")]
     IdaError(String),
 
@@ -163,6 +167,7 @@ impl ToolError {
             | ToolError::PoolExhausted { .. }
             | ToolError::NeverDispatched(_)
             | ToolError::RemoteProtocol(_)
+            | ToolError::RemoteCall(_)
             | ToolError::IdaError(_)
             | ToolError::DebuggerTeardown(_)
             | ToolError::DebuggerStartRetained(_)

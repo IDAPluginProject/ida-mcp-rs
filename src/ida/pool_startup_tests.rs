@@ -32,6 +32,7 @@ impl Fixture {
         // until the test releases it, then behave like an idle MCP server.
         let script = r#"
 IFS= read -r request || exit 1
+case "$request" in *'"protocolVersion":"2025-11-25"'*) ;; *) exit 2;; esac
 printf '%s\n' "$$" > "$1/pid"
 while [ ! -e "$1/ready" ]; do sleep 0.05; done
 id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
@@ -43,6 +44,9 @@ while IFS= read -r request; do
             case "$request" in *'"name":"stall"'*) continue;; esac
             case "$request" in *'"name":"delay"'*) while [ ! -e "$1/release-call" ]; do sleep 0.05; done;; esac
             id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+            case "$request" in *'"name":"protocol-error"'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"request rejected"}}\n' "$id"; continue;; esac
+            case "$request" in *'"reject_open":true'*) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"cancelled is just argument text"}}\n' "$id"; continue;; esac
+            case "$request" in *'"name":"close_idb"'*) if [ -e "$1/reject-close" ]; then printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"close rejected before dispatch","data":"worker-private-data"}}\n' "$id"; continue; fi;; esac
             printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"isError":false}}\n' "$id"
             ;;
     esac
@@ -103,6 +107,130 @@ async fn assert_process_exited(pid: i32) {
     })
     .await
     .expect("worker process exited and was reaped");
+}
+
+#[tokio::test]
+async fn correlated_protocol_error_keeps_the_worker_usable() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let database = WorkspaceDatabase::new(pool.clone(), "protocol-error".into());
+    let (handle, generation, _) = database.lease_for_open().await.expect("lease worker");
+    let pid = fixture.pid().await;
+    let result = database
+        .call_result_for_generation(
+            "protocol-error",
+            serde_json::json!({}),
+            Some(1),
+            None,
+            Some(generation),
+        )
+        .await
+        .expect_err("a correlated error remains typed");
+    let ToolError::RemoteCall(error) = result else {
+        panic!("completed protocol error lost its type: {result:?}");
+    };
+    assert_eq!(error.code.0, -32602);
+    database
+        .call_result_for_generation(
+            "next-call",
+            serde_json::json!({}),
+            Some(1),
+            None,
+            Some(generation),
+        )
+        .await
+        .expect("the same lease remains usable");
+    assert_eq!(handle.slot.child.lock().await.pid, u32::try_from(pid).ok());
+    pool.shutdown_all().await;
+    assert_process_exited(pid).await;
+}
+
+#[tokio::test]
+async fn correlated_open_error_is_not_classified_from_its_message() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let handle = pool
+        .lease("protocol-open-error")
+        .await
+        .expect("lease worker");
+    let pid = fixture.pid().await;
+    let original_path = fixture.directory.join("original.i64");
+    handle.slot.child.lock().await.idb_path = Some(original_path.clone());
+    let mut args = JsonObject::new();
+    args.insert("reject_open".into(), serde_json::Value::Bool(true));
+    let result = handle
+        .call_tool(
+            "open_idb",
+            args,
+            Duration::from_secs(1),
+            None,
+            Some(OpenDispatch {
+                database_path: fixture.directory.join("rejected.i64"),
+                artifacts: None,
+            }),
+            None,
+        )
+        .await
+        .expect_err("correlated open error");
+    let ToolError::RemoteCall(error) = result else {
+        panic!("completed protocol error lost its type: {result:?}");
+    };
+    assert_eq!(error.code.0, -32602);
+    assert!(error.message.contains("cancelled"));
+    assert_eq!(handle.slot.child.lock().await.idb_path, Some(original_path));
+    handle
+        .call_tool(
+            "next-call",
+            JsonObject::new(),
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("same worker remains usable");
+    assert_eq!(handle.slot.child.lock().await.pid, u32::try_from(pid).ok());
+    pool.shutdown_all().await;
+    assert_process_exited(pid).await;
+}
+
+#[tokio::test]
+async fn correlated_close_error_cannot_return_the_worker_to_idle() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let original = pool.lease("unconfirmed-close").await.expect("lease worker");
+    let original_pid = fixture.pid().await;
+    original.slot.child.lock().await.idb_path = Some(fixture.directory.join("original.i64"));
+    std::fs::write(fixture.directory.join("reject-close"), b"").expect("reject close");
+    let error = pool
+        .release(original.clone())
+        .await
+        .expect_err("close must fail");
+    let ToolError::WorkerRetired(message) = error else {
+        panic!("unconfirmed close was not retired: {error:?}")
+    };
+    assert!(message.contains("save could not be confirmed"));
+    assert!(!message.contains("worker-private-data"));
+    assert_eq!(original.slot.child.lock().await.state, ChildState::Dead);
+    assert_process_exited(original_pid).await;
+    let replacement = pool.lease("replacement").await.expect("replacement lease");
+    assert_ne!(replacement.worker_id, original.worker_id);
+    assert_ne!(fixture.pid().await, original_pid);
+    replacement
+        .call_tool(
+            "probe",
+            JsonObject::new(),
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("fresh process is usable");
+    pool.shutdown_all().await;
 }
 
 #[tokio::test]
@@ -631,5 +759,70 @@ async fn shutdown_rejects_queued_calls_without_unbinding_the_database() {
         .expect("database remains available for saving");
     drop(busy);
     database.close().await.expect("save during shutdown");
+    pool.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn public_drain_rejects_busy_waiters_but_allows_idle_pipeline_work() {
+    let fixture = Fixture::new();
+    fixture.ready();
+    let pool = fixture.pool(Duration::from_secs(3));
+    let handle = pool.lease("public-drain").await.expect("lease worker");
+    let busy = handle.slot.call_lock.lock().await;
+    let caller = handle.clone();
+    let waiting = tokio::spawn(async move {
+        caller
+            .call_tool(
+                "queued",
+                JsonObject::new(),
+                Duration::from_secs(60),
+                None,
+                None,
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.slot.queued.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request queued");
+    pool.begin_drain();
+    let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("queued call wakes promptly")
+        .expect("call task");
+    let Err(ToolError::NeverDispatched(_)) = result else {
+        panic!("queued call should be rejected without dispatch: {result:?}");
+    };
+    drop(busy);
+    let child = handle.slot.child.lock().await;
+    let mut waiting_for_state = Box::pin(handle.call_tool(
+        "waiting-for-child-state",
+        JsonObject::new(),
+        Duration::from_secs(60),
+        None,
+        None,
+        None,
+    ));
+    assert!(futures_util::poll!(waiting_for_state.as_mut()).is_pending());
+    drop(child);
+    tokio::time::timeout(Duration::from_secs(1), waiting_for_state)
+        .await
+        .expect("child-state admission settles")
+        .expect("an idle worker remains admissible during drain");
+    handle
+        .call_tool(
+            "idle-pipeline",
+            JsonObject::new(),
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("already-received idle work remains admissible");
     pool.shutdown_all().await;
 }

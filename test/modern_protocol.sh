@@ -249,6 +249,16 @@ run_http_modern() {
     '.result.resultType == "complete"
      and (.result.supportedVersions | index("2026-07-28") != null)'
 
+  local missing_session_status
+  missing_session_status="$(curl -sS -o "$tmpdir/http-missing-session.out" -w '%{http_code}' \
+    "${http_headers[@]}" -H "MCP-Protocol-Version: 2025-11-25" \
+    -d '{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}' "$url")"
+  if [[ "$missing_session_status" != 400 ]]; then
+    echo "legacy HTTP request without a session returned $missing_session_status, expected 400" >&2
+    cat "$tmpdir/http-missing-session.out" >&2
+    exit 1
+  fi
+
   local list="{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/list\",\"params\":{\"_meta\":$META}}"
   curl -sS -D "$tmpdir/http-headers.out" "${http_headers[@]}" \
     -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Method: tools/list" \

@@ -118,6 +118,10 @@ test-lvars: test-bootstrap
 test-pseudocode-comments: test-bootstrap
     python3 ./stdio_pseudocode_comments.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
 
+# Oversized requests and replies must not retire a healthy worker.
+test-message-limits: test-bootstrap
+    python3 ./stdio_message_limits.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+
 # Verify that license validation succeeds during preflight or database open.
 test-license: fixture
     #!/usr/bin/env bash

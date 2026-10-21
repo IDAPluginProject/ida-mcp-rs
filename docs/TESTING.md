@@ -20,6 +20,7 @@ just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
 just test-stuck-call # Stuck-call retirement, immediate reopen, queued calls, orphans
 just test-lvars # Native Hex-Rays local edits, persistence, and read-only filtering
 just test-pseudocode-comments # Native pseudocode comment listing, edits, and persistence
+just test-message-limits # Oversized MCP frames preserve workers and unsaved edits
 just test-shutdown-signal # Signal/EOF shutdown saves, hung-close deadline, SIGKILL flush
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
@@ -91,6 +92,14 @@ builds the debug binary before running its harness.
 - Rejects stale and wrong-function locators without changing any comment
 - Sets, replaces, and deletes comments, then checks the pseudocode after saving and reopening, on default stdio and `--workspace`
 
+**Message-limit test** (`just test-message-limits`)
+- Rejects an oversized private worker request before dispatch
+- Checks script-file size before decoding UTF-8
+- Returns a correlated tool error for an oversized worker reply
+- Bounds the final public reply including long client request IDs, even after a mutation ran
+- Requires a correlated rejection when an oversized public request's ID is recoverable
+- Discards oversized frames without a recoverable request ID, including notifications and responses, and resumes at the next line
+
 **Stuck-call test** (`just test-stuck-call`)
 - Reopens immediately after a stuck call retires the worker, with no sleep or
   retry in between (`stdio_reopen.py`)
@@ -106,6 +115,8 @@ builds the debug binary before running its harness.
   watchdog
 
 **Shutdown-signal test** (`just test-shutdown-signal`)
+- A departed client's unanswered elicitation prompt cannot delay saving the open database
+- Stdin EOF during foreground work waits for the operation and preserves an unsaved rename
 - SIGTERM and SIGHUP with stdin still open save an unsaved rename and exit,
   on default stdio and with `--workspace`
 - With IDA's `closebase` hung, SIGTERM, SIGHUP, and stdin EOF still exit

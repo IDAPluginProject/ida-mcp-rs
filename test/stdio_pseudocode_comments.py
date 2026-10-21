@@ -71,7 +71,11 @@ def exercise(binary, fixture, workspace):
             other = decode(client.call("resolve_function", {"name": "helper_mix"}))
             rejected(write(alternative, "wrong function", target_name=other["name"]), "stale")
             rejected(write(alternative, "stale", comment_locator=alternative["locator"] + "0"), "stale")
-            assert locations() == initial
+            # Decompiling another function can refine types in the rendered text.
+            assert [{key: value for key, value in row.items() if key != "text"}
+                    for row in locations()] == [
+                        {key: value for key, value in row.items() if key != "text"}
+                        for row in initial]
 
             if platform.machine().lower() in ("arm64", "aarch64"):
                 check_shared_slot(client)
